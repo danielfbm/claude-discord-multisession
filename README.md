@@ -32,6 +32,7 @@ Navigate to **OAuth2** → **URL Generator**. Select the `bot` scope. Under **Bo
 - View Channels
 - Send Messages
 - Send Messages in Threads
+- Create Public Threads
 - Read Message History
 - Attach Files
 - Add Reactions
@@ -87,6 +88,61 @@ Pairing is for capturing IDs. Once you're in, switch to `allowlist` so strangers
 See **[ACCESS.md](./ACCESS.md)** for DM policies, guild channels, mention detection, delivery config, skill commands, and the `access.json` schema.
 
 Quick reference: IDs are Discord **snowflakes** (numeric — enable Developer Mode, right-click → Copy ID). Default policy is `pairing`. Guild channels are opt-in per channel ID.
+
+## Multi-session via threads
+
+Run multiple Claude Code sessions through one bot, each in its own Discord
+thread under a configured parent channel.
+
+1. Pick a guild channel to host threads. Get its snowflake (Developer Mode →
+   right-click → Copy Channel ID).
+2. Set it as the parent channel:
+
+   ```
+   /discord:configure parent 846209781206941736
+   ```
+
+   This also opts the channel into `groups`, so inbound thread messages
+   pass the gate.
+3. In any working directory, launch Claude Code with the channel flag and
+   ask for an auto-thread:
+
+   ```sh
+   DISCORD_THREAD_ID=auto claude --channels plugin:discord@claude-plugins-official
+   ```
+
+   The bot creates a thread named `<cwd-basename>-<short-id>` and binds
+   this session to it. Subsequent `claude` runs in the same directory
+   reuse the same thread.
+4. Launch a *second* session in another directory the same way; it gets
+   its own thread.
+5. Plain DMs to the bot continue to land in whichever session was launched
+   without `DISCORD_THREAD_ID` (the "DM session"). Only one DM session is
+   allowed at a time.
+
+### How it works
+
+A long-lived **daemon** owns the single Discord gateway connection. Each
+session's MCP server (the **shim**) talks to the daemon over a Unix socket
+at `~/.claude/channels/discord/daemon.sock`. The daemon is lazy-spawned by
+the first shim and idle-exits 60 s after the last shim disconnects.
+
+### Permissions
+
+Thread sessions post permission prompts inside the bound thread (so the
+human can answer in-context). The DM session keeps fanning prompts to all
+DMs in `allowFrom`.
+
+### Bot permissions
+
+Add **Create Public Threads** alongside the others listed in step 3 of
+Quick Setup so the bot can auto-create threads under your parent channel.
+
+### Resetting a binding
+
+If you want to start fresh in a working directory (new thread for the same
+cwd), edit `~/.claude/channels/discord/bindings.json` and remove the
+session entry. The next launch creates a new thread.
 
 ## Tools exposed to the assistant
 

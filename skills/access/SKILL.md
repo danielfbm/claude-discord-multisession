@@ -43,9 +43,14 @@ Arguments passed: `$ARGUMENTS`
       "createdAt": <ms>, "expiresAt": <ms>
     }
   },
-  "mentionPatterns": ["@mybot"]
+  "mentionPatterns": ["@mybot"],
+  "parentChannelId": "<channelId>"
 }
 ```
+
+`parentChannelId` is the channel under which auto-thread-creation spawns
+new threads when a Claude Code session is launched with
+`DISCORD_THREAD_ID=auto`.
 
 Missing file = `{dmPolicy:"pairing", allowFrom:[], groups:{}, pending:{}}`.
 
@@ -109,12 +114,16 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 ### `set <key> <value>`
 
 Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
-`textChunkLimit`, `chunkMode`, `mentionPatterns`. Validate types:
+`textChunkLimit`, `chunkMode`, `mentionPatterns`, `parentChannelId`.
+Validate types:
 - `ackReaction`: string (emoji) or `""` to disable
 - `replyToMode`: `off` | `first` | `all`
 - `textChunkLimit`: number
 - `chunkMode`: `length` | `newline`
 - `mentionPatterns`: JSON array of regex strings
+- `parentChannelId`: string (channel snowflake) or `""` to clear. When
+  setting a non-empty value, also opt that channel into `groups` if it
+  isn't already (mirror `/discord:configure parent`).
 
 Read, set the key, write, confirm.
 

@@ -58,6 +58,22 @@ With the default `requireMention: true`, the bot responds only when @mentioned o
 /discord:access group rm 846209781206941736
 ```
 
+## Parent channel for thread sessions
+
+`parentChannelId` is the channel under which `DISCORD_THREAD_ID=auto`
+spawns new threads. Set it via `/discord:configure parent <channelId>` or
+`/discord:access set parentChannelId <channelId>`. Setting it also opts
+the channel into `groups` if it isn't already (with default
+`requireMention: true`, empty `allowFrom`), so inbound thread messages
+pass the gate.
+
+A daemon-side `bindings.json` file stores the session→thread mapping;
+restarting Claude Code in the same working directory reattaches to the
+same thread. Delete the entry to force a fresh thread.
+
+The bot needs **Create Public Threads** permission on the parent channel
+to auto-create.
+
 ## Mention detection
 
 In channels with `requireMention: true`, any of the following triggers the bot:
@@ -101,7 +117,8 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
 | `/discord:access policy allowlist` | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`. |
 | `/discord:access group add 846209781206941736` | Enable a guild channel. Flags: `--no-mention`, `--allow id1,id2`. |
 | `/discord:access group rm 846209781206941736` | Disable a guild channel. |
-| `/discord:access set ackReaction 🔨` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`. |
+| `/discord:access set ackReaction 🔨` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`, `parentChannelId`. |
+| `/discord:configure parent 846209781206941736` | Set the parent channel for `DISCORD_THREAD_ID=auto`. Also opts that channel into `groups`. |
 
 ## Config file
 
@@ -138,6 +155,9 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
   "textChunkLimit": 2000,
 
   // length = cut at limit. newline = prefer paragraph boundaries.
-  "chunkMode": "newline"
+  "chunkMode": "newline",
+
+  // Parent channel under which DISCORD_THREAD_ID=auto creates threads.
+  "parentChannelId": "846209781206941736"
 }
 ```

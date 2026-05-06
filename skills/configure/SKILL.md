@@ -33,6 +33,8 @@ Read both state files and give the user a complete picture:
    - Allowed senders: count, and list display names or snowflakes
    - Pending pairings: count, with codes and display names if any
    - Guild channels opted in: count
+   - Parent channel for thread sessions: `parentChannelId` (or *not set*).
+     Required when running with `DISCORD_THREAD_ID=auto`.
 
 3. **What next** — end with a concrete next step based on state:
    - No token → *"Run `/discord:configure <token>` with your bot token from
@@ -86,6 +88,30 @@ as the correct long-term choice. Don't skip the lockdown offer.
 ### `clear` — remove the token
 
 Delete the `DISCORD_BOT_TOKEN=` line (or the file if that's the only line).
+
+### `parent <channelId>` — set the parent channel for thread sessions
+
+Threaded multi-session mode auto-creates a thread per Claude Code session
+under a configured parent channel. Set it here.
+
+1. Validate that `<channelId>` is a numeric snowflake (digits only).
+2. Read `~/.claude/channels/discord/access.json` (create defaults if missing).
+3. Set `access.parentChannelId = <channelId>`.
+4. If `<channelId>` is not already a key in `access.groups`, also set
+   `access.groups[<channelId>] = { requireMention: true, allowFrom: [] }`.
+   Inbound thread messages still pass through the gate, which requires
+   the parent to be opted in.
+5. Write the file. Confirm both: `parentChannelId` set and the channel
+   opted into `groups` (so threads under it route correctly).
+6. Remind the user that the bot needs **Create Public Threads** permission
+   on that channel to auto-create.
+
+### `parent clear` — unset the parent channel
+
+1. Read `access.json`. Delete the `parentChannelId` field. Write back.
+2. Note: this does not remove the corresponding `groups` entry — leave that
+   for `/discord:access group rm <channelId>` if the user wants to fully
+   un-opt-in.
 
 ---
 
