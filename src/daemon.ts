@@ -29,6 +29,13 @@ export type DaemonOpts = {
   stateDir: string
   ops: DiscordOps
   idleExitMs: number
+  /**
+   * Called after the internal shutdown unlinks sock + pid. The entrypoint
+   * uses this to destroy the discord.js client and call `process.exit(0)`,
+   * because discord.js's gateway WebSocket otherwise keeps the event loop
+   * alive — leaving a zombie daemon with no IPC socket.
+   */
+  onShutdown?: () => void | Promise<void>
 }
 
 export type DaemonHandle = {
@@ -56,7 +63,7 @@ async function probeStaleSocket(sockPath: string): Promise<void> {
 }
 
 export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
-  const { stateDir, ops, idleExitMs } = opts
+  const { stateDir, ops, idleExitMs, onShutdown } = opts
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   const sockPath = join(stateDir, 'daemon.sock')
   const pidPath = join(stateDir, 'daemon.pid')
@@ -160,6 +167,11 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
     await new Promise<void>(r => server.close(() => r()))
     try { unlinkSync(sockPath) } catch {}
     try { unlinkSync(pidPath) } catch {}
+    if (onShutdown) {
+      try { await onShutdown() } catch (err) {
+        process.stderr.write(`daemon: onShutdown failed: ${err}\n`)
+      }
+    }
   }
 
   async function runTool(name: string, args: Record<string, unknown>): Promise<{ content: { type: 'text'; text: string }[]; isError?: boolean }> {

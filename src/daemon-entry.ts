@@ -59,7 +59,13 @@ export async function runDaemon(): Promise<void> {
   const accessFile = join(stateDir, 'access.json')
   const ops = new RealDiscordOps(client, () => loadAccess(accessFile), stateDir)
 
-  const handle = await startDaemon({ stateDir, ops, idleExitMs: 60_000 })
+  const handle = await startDaemon({
+    stateDir, ops, idleExitMs: 60_000,
+    onShutdown: async () => {
+      try { await client.destroy() } catch {}
+      process.exit(0)
+    },
+  })
 
   const dmChannelUsers = new Map<string, string>()
 
@@ -201,11 +207,8 @@ export async function runDaemon(): Promise<void> {
     process.exit(1)
   })
 
-  const shutdown = async () => {
-    try { await handle.shutdown() } catch {}
-    try { await client.destroy() } catch {}
-    process.exit(0)
-  }
+  // handle.shutdown invokes onShutdown, which destroys the client and exits.
+  const shutdown = () => { void handle.shutdown() }
   process.on('SIGTERM', shutdown)
   process.on('SIGINT', shutdown)
   process.stdin.on('end', shutdown)

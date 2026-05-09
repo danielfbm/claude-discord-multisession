@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, rmSync } from 'fs'
+import { existsSync, mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { createConnection, type Socket } from 'net'
@@ -61,6 +61,47 @@ describe('daemon: socket', () => {
       await startDaemon({ stateDir: dir, ops: new FakeDiscordOps(), idleExitMs: 60_000 })
     } catch { threw = true }
     expect(threw).toBe(true)
+  })
+
+  test('shutdown invokes onShutdown after unlinking sock/pid', async () => {
+    let onShutdownCalled = false
+    let sockPathAtCallback = true
+    let pidPathAtCallback = true
+    const sockPath = join(dir, 'daemon.sock')
+    const pidPath = join(dir, 'daemon.pid')
+
+    const d = await startDaemon({
+      stateDir: dir,
+      ops: new FakeDiscordOps(),
+      idleExitMs: 60_000,
+      onShutdown: () => {
+        onShutdownCalled = true
+        sockPathAtCallback = existsSync(sockPath)
+        pidPathAtCallback = existsSync(pidPath)
+      },
+    })
+    expect(existsSync(sockPath)).toBe(true)
+    expect(existsSync(pidPath)).toBe(true)
+
+    await d.shutdown()
+    // Don't let afterEach call shutdown again.
+    daemon = null
+
+    expect(onShutdownCalled).toBe(true)
+    expect(sockPathAtCallback).toBe(false)
+    expect(pidPathAtCallback).toBe(false)
+  })
+
+  test('onShutdown errors are swallowed (do not throw from shutdown)', async () => {
+    daemon = await startDaemon({
+      stateDir: dir,
+      ops: new FakeDiscordOps(),
+      idleExitMs: 60_000,
+      onShutdown: () => { throw new Error('boom') },
+    })
+    await daemon.shutdown()
+    daemon = null
+    // Reaching here means shutdown didn't reject.
   })
 })
 
