@@ -96,9 +96,13 @@ Writes `DISCORD_BOT_TOKEN=...` to `~/.claude/channels/discord/.env`. You can
 also write that file by hand, or `export DISCORD_BOT_TOKEN=...` — shell env
 takes precedence over the file.
 
-> To run multiple bots on one machine (different tokens, separate
-> allowlists), point `DISCORD_STATE_DIR` at a different directory per
-> instance.
+> **State directory resolution.** The plugin picks the channel state dir
+> in this order: `$DISCORD_STATE_DIR`, then
+> `$CLAUDE_CONFIG_DIR/channels/discord` (if `CLAUDE_CONFIG_DIR` is set —
+> devcontainers, shared volumes), then `~/.claude/channels/discord`.
+> If you've relocated Claude Code's config dir, the channel follows it
+> automatically. Use `DISCORD_STATE_DIR` only when running multiple bots
+> on one machine (different tokens, separate allowlists).
 
 **5. Relaunch with the channel flag.**
 

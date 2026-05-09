@@ -6,13 +6,13 @@ import { createConnection, type Socket } from 'net'
 import { existsSync, openSync, mkdirSync } from 'fs'
 import { spawn } from 'child_process'
 import { join, resolve, dirname } from 'path'
-import { homedir } from 'os'
 import { fileURLToPath } from 'url'
 import { readFrames, writeFrame } from './framing'
 import { parseDaemonMsg } from './protocol'
 import { deriveSessionId } from './session-id'
+import { getStateDir } from './state-dir'
 
-const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
+const STATE_DIR = getStateDir()
 const SOCK_PATH = join(STATE_DIR, 'daemon.sock')
 const LOG_PATH = join(STATE_DIR, 'daemon.log')
 const THREAD_ENV = process.env.DISCORD_THREAD_ID

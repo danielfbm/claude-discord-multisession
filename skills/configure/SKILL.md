@@ -11,10 +11,25 @@ allowed-tools:
 
 # /discord:configure — Discord Channel Setup
 
-Writes the bot token to `~/.claude/channels/discord/.env` and orients the
-user on access policy. The server reads both files at boot.
+Writes the bot token to the channel state dir and orients the user on
+access policy. The server reads both files at boot.
 
 Arguments passed: `$ARGUMENTS`
+
+---
+
+## State directory
+
+Resolve once from the environment, then use for every path below:
+
+1. `$DISCORD_STATE_DIR` if set.
+2. Otherwise `$CLAUDE_CONFIG_DIR/channels/discord` if `CLAUDE_CONFIG_DIR`
+   is set (devcontainers, shared volumes).
+3. Otherwise `$HOME/.claude/channels/discord`.
+
+Paths written as `~/.claude/channels/discord/...` below are shorthand —
+substitute the resolved dir. The plugin daemon resolves the same way, so
+the .env you write here is the one it reads.
 
 ---
 

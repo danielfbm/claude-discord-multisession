@@ -13,15 +13,15 @@ import {
 } from 'discord.js'
 import { readFileSync, chmodSync, readdirSync, rmSync, mkdirSync } from 'fs'
 import { join } from 'path'
-import { homedir } from 'os'
 import { startDaemon } from './daemon'
 import { RealDiscordOps } from './discord-ops-real'
 import { loadAccess } from './access'
+import { getStateDir } from './state-dir'
 
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 export async function runDaemon(): Promise<void> {
-  const stateDir = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
+  const stateDir = getStateDir()
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   const envFile = join(stateDir, '.env')
   try {
