@@ -139,6 +139,15 @@ the allowlist holds them.
 
 Run multiple CC sessions through one bot, each in its own Discord thread.
 
+> **Configure `parentChannelId` (step 2) before launching with
+> `DISCORD_THREAD_ID=auto`.** Without a parent set, the shim refuses to
+> register in thread mode and Claude Code surfaces it as the generic
+> *"Failed to reconnect to plugin:discord:discord"*. The real error is
+> `register failed (parent_channel_unset)` in `<state-dir>/daemon.log`.
+> If your shell rc exports `DISCORD_THREAD_ID=auto` globally, complete
+> Quick Setup in DM mode first (open a shell without the var), set the
+> parent, then re-enable. See [Troubleshooting](#troubleshooting).
+
 **1. Pick a parent channel.** Get its snowflake (Developer Mode →
 right-click → Copy Channel ID). The bot must be a member of the guild that
 owns this channel and have `Create Public Threads` there.
@@ -256,6 +265,24 @@ Downloads land in `~/.claude/channels/discord/inbox/`.
 
 Same path for attachments on historical messages found via `fetch_messages`
 (messages with attachments are marked `+Natt`).
+
+## Troubleshooting
+
+When the shim fails to start, Claude Code shows the generic *"Failed to
+reconnect to plugin:discord:discord"*. The real cause lives in
+`<state-dir>/daemon.log` and on the shim's stderr. `<state-dir>` resolves
+to `$DISCORD_STATE_DIR`, then `$CLAUDE_CONFIG_DIR/channels/discord`, then
+`~/.claude/channels/discord` (see step 4 of Quick Setup).
+
+| Error | Cause | Fix |
+| --- | --- | --- |
+| `discord daemon: DISCORD_BOT_TOKEN required\n  set in <path>/.env` | `.env` is in a different dir than the daemon resolves to. | Check `$CLAUDE_CONFIG_DIR` / `$DISCORD_STATE_DIR`; place `.env` in the dir the daemon actually points at (the path printed in the error). |
+| `discord shim: register failed (parent_channel_unset)` | Launched with `DISCORD_THREAD_ID=auto` but `parentChannelId` is unset. | `/discord:configure parent <channelId>` first, then relaunch. |
+| `discord daemon: login failed: Error [TokenInvalid]` | Token is malformed or revoked. | Developer Portal → Bot → Reset Token, then `/discord:configure <new-token>`. |
+| MCP disconnects after working briefly, no clear error | Multiple daemons racing for the socket (resolved in 0.0.6). | `/plugin update discord@danielfbm-discord`, kill stray `bun ... server.ts --daemon` processes, restart Claude Code. |
+
+If `daemon.log` is empty, the daemon never spawned — verify `bun` is on
+`$PATH` and the cache install dir has a populated `node_modules/`.
 
 ## License
 
