@@ -34,7 +34,8 @@ describe('session-id', () => {
 
   test('deriveThreadName honors override and sanitizes', () => {
     expect(deriveThreadName('/home/me/foo', 'abcdef0123ab', 'My Custom Thread')).toBe('My Custom Thread')
-    expect(deriveThreadName('/home/me/foo', 'abcdef0123ab', '  bad/chars\n!  ')).toBe('badchars')
+    expect(deriveThreadName('/home/me/foo', 'abcdef0123ab', '  bad,chars\n!  ')).toBe('badchars')
+    expect(deriveThreadName('/home/me/foo', 'abcdef0123ab', 'claude/catalog-incubator')).toBe('claude/catalog-incubator')
   })
 
   test('deriveThreadName falls back to basename when override is blank after sanitization', () => {

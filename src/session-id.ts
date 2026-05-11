@@ -23,7 +23,9 @@ export function deriveSessionId(cwd: string): string {
  */
 export function deriveThreadName(cwd: string, sessionId: string, override?: string): string {
   if (override) {
-    const safe = override.replace(/[^\w\s.-]/g, '').trim().slice(0, 90)
+    // Whitelist: word chars, whitespace, `.`, `-`, and `/` (commonly used as a
+    // namespace separator, e.g. "claude/foo"). Discord threads accept `/`.
+    const safe = override.replace(/[^\w\s./-]/g, '').trim().slice(0, 90)
     if (safe) return safe
   }
   const raw = basename(cwd) || 'claude'
