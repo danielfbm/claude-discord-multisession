@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeEach, afterEach } from 'bun:test'
-import { existsSync, mkdtempSync, rmSync } from 'fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { createConnection, type Socket } from 'net'
@@ -15,6 +15,9 @@ beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'discord-daemon-')) })
 afterEach(async () => {
   for (const s of liveSockets) { try { s.destroy() } catch {} }
   liveSockets.length = 0
+  // Restore writable mode in case a test chmod-ed the state dir read-only —
+  // otherwise shutdown's sock/pid unlink and the rmSync below would EACCES.
+  try { chmodSync(dir, 0o700) } catch {}
   if (daemon) { await daemon.shutdown(); daemon = null }
   rmSync(dir, { recursive: true, force: true })
 })
@@ -333,6 +336,192 @@ describe('daemon: register', () => {
     expect(replyCall).toBeTruthy()
     expect(replyCall.text).toMatch(/Pairing required/)
     expect(replyCall.text).toMatch(/[0-9a-f]{6}/)
+  })
+
+  // Regression: two concurrent thread-mode auto registers with the same
+  // session_id used to both pass the `sessions.has()` check (it ran before
+  // any await yielded), both await createThread, both upsert, both ack —
+  // leaving two Discord threads and two ack frames for one logical session.
+  // Fix reserves session_id synchronously after the check, so the second
+  // call sees the placeholder and fails fast.
+  test('concurrent same session_id auto register: exactly one ack, one err', async () => {
+    // Wrap FakeDiscordOps so createThread yields long enough for both
+    // handlers to reach the await without one finishing first.
+    class SlowOps extends FakeDiscordOps {
+      override async createThread(parent_channel_id: string, name: string) {
+        await new Promise(r => setTimeout(r, 30))
+        return super.createThread(parent_channel_id, name)
+      }
+    }
+    const ops = new SlowOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.parentChannelId = 'parent-1'
+    a.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), a)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sockPath = join(dir, 'daemon.sock')
+
+    const launch = async () => {
+      const sock = await connect(sockPath)
+      const it = frameIterator(sock)
+      writeFrame(sock, { type: 'register', id: 1, session_id: 'dup', mode: 'thread', cwd: '/x', thread_id: 'auto' })
+      return recv(it)
+    }
+    const [a1, a2] = await Promise.all([launch(), launch()])
+    const types = [a1.type, a2.type].sort()
+    expect(types).toEqual(['register_ack', 'register_err'])
+    const errFrame = a1.type === 'register_err' ? a1 : a2
+    expect(errFrame.code).toBe('thread_session_taken')
+    // Exactly one Discord thread should have been created.
+    expect(ops.calls.filter(c => c.kind === 'createThread')).toHaveLength(1)
+    // bindings.json has only the one successful registration.
+    const { loadBindings } = await import('../src/bindings')
+    const onDisk = loadBindings(join(dir, 'bindings.json'))
+    expect(Object.keys(onDisk)).toEqual(['dup'])
+  })
+
+  // Regression: explicit-thread register used to call upsertBinding BEFORE
+  // checking threadIndex.has(threadId). When a second session tried to bind
+  // an already-bound thread, the daemon would reject with
+  // `thread_session_taken` but still leave that session's binding on disk.
+  // Fix moves the threadIndex check (and a synchronous reservation) ahead of
+  // the upsert.
+  test('explicit thread already taken: rejection leaves no binding on disk', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const acc = defaultAccess()
+    acc.parentChannelId = 'parent-1'
+    acc.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), acc)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sockPath = join(dir, 'daemon.sock')
+
+    // First, create a thread via auto so we have a real, opted-in thread id.
+    const sock1 = await connect(sockPath)
+    const it1 = frameIterator(sock1)
+    writeFrame(sock1, { type: 'register', id: 1, session_id: 's1', mode: 'thread', cwd: '/x', thread_id: 'auto' })
+    const ack1 = await recv(it1)
+    expect(ack1.type).toBe('register_ack')
+    const threadId: string = ack1.thread_id
+
+    // Now try to register a second session against the same explicit thread.
+    const sock2 = await connect(sockPath)
+    const it2 = frameIterator(sock2)
+    writeFrame(sock2, { type: 'register', id: 1, session_id: 's2', mode: 'thread', cwd: '/x', thread_id: threadId })
+    const ack2 = await recv(it2)
+    expect(ack2.type).toBe('register_err')
+    expect(ack2.code).toBe('thread_session_taken')
+
+    // Critical: s2 must NOT have left a binding on disk.
+    const { loadBindings } = await import('../src/bindings')
+    const onDisk = loadBindings(join(dir, 'bindings.json'))
+    expect(Object.keys(onDisk).sort()).toEqual(['s1'])
+    expect(onDisk.s1.thread_id).toBe(threadId)
+  })
+
+  // Regression: when upsertBinding throws (disk full, EACCES, etc.), the
+  // daemon must emit `bindings_save_failed` AND roll back every reservation
+  // it made — placeholder session entry, reserved threadIndex slot — so the
+  // shim can retry the registration without colliding with a stale claim.
+  test('bindings_save_failed: register fails cleanly and state is rolled back', async () => {
+    // Slow down createThread so the test can chmod the state dir read-only
+    // after register starts but before upsertBinding runs. With a stable
+    // ordering we don't depend on any other implicit timing.
+    class SlowOps extends FakeDiscordOps {
+      override async createThread(parent_channel_id: string, name: string) {
+        await new Promise(r => setTimeout(r, 50))
+        return super.createThread(parent_channel_id, name)
+      }
+    }
+    const ops = new SlowOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const acc = defaultAccess()
+    acc.parentChannelId = 'parent-1'
+    acc.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), acc)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sockPath = join(dir, 'daemon.sock')
+
+    const sock = await connect(sockPath)
+    const it = frameIterator(sock)
+    writeFrame(sock, { type: 'register', id: 1, session_id: 'sess', mode: 'thread', cwd: '/x', thread_id: 'auto' })
+
+    // Make the state dir read-execute only after the register has been
+    // dispatched. upsertBinding's writeFileSync(tmp, ...) will then EACCES
+    // when the daemon reaches it, hitting the bindings_save_failed branch.
+    await new Promise(r => setTimeout(r, 10))
+    chmodSync(dir, 0o500)
+
+    const ack = await recv(it)
+    expect(ack.type).toBe('register_err')
+    expect(ack.code).toBe('bindings_save_failed')
+
+    // Restore write access so the rollback verification below can succeed,
+    // and so afterEach can clean up.
+    chmodSync(dir, 0o700)
+
+    // Roll-back verification: a second register with the SAME session_id
+    // must succeed end-to-end. If `sessions` still held the placeholder, it
+    // would short-circuit with "this session_id is already registered". If
+    // `threadIndex` still held the previously-reserved thread, the new
+    // createThread would yield a fresh id but a stale claim would persist
+    // (not directly observable through this socket, so we focus on the
+    // session-level invariant first).
+    sock.destroy()
+    const sock2 = await connect(sockPath)
+    const it2 = frameIterator(sock2)
+    writeFrame(sock2, { type: 'register', id: 1, session_id: 'sess', mode: 'thread', cwd: '/x', thread_id: 'auto' })
+    const ack2 = await recv(it2)
+    expect(ack2.type).toBe('register_ack')
+    expect(ack2.thread_id).toBeTruthy()
+
+    // The first attempt's threadIndex reservation must have been released —
+    // otherwise registering the second time would re-claim against a
+    // dangling entry. We assert indirectly: the second attempt also lands
+    // its binding cleanly on disk, with exactly one entry for `sess`.
+    const { loadBindings } = await import('../src/bindings')
+    const onDisk = loadBindings(join(dir, 'bindings.json'))
+    expect(Object.keys(onDisk)).toEqual(['sess'])
+    expect(onDisk.sess.thread_id).toBe(ack2.thread_id)
+  })
+
+  // Regression: a corrupt or unreadable bindings.json must not crash the
+  // daemon message loop for every other shim. The offending register gets
+  // bindings_load_failed; the daemon stays up and other connections work.
+  test('bindings_load_failed: bad bindings.json fails one register, daemon stays up', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const acc = defaultAccess()
+    acc.parentChannelId = 'parent-1'
+    acc.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), acc)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sockPath = join(dir, 'daemon.sock')
+
+    // Replace bindings.json with a directory so readFileSync throws EISDIR
+    // (loadBindings can't auto-recover from this the way it does for
+    // unparseable JSON — there's nothing to rename).
+    mkdirSync(join(dir, 'bindings.json'))
+
+    const sock = await connect(sockPath)
+    const it = frameIterator(sock)
+    writeFrame(sock, { type: 'register', id: 1, session_id: 's1', mode: 'thread', cwd: '/x', thread_id: 'auto' })
+    const ack = await recv(it)
+    expect(ack.type).toBe('register_err')
+    expect(ack.code).toBe('bindings_load_failed')
+
+    // The daemon's message loop must still be alive: ping/pong should work
+    // on this same connection. (Before the loadBindings try/catch, the
+    // exception would have bubbled out of the loop and the daemon would
+    // stop processing this connection entirely.)
+    writeFrame(sock, { type: 'ping', id: 2 })
+    const pong = await recv(it)
+    expect(pong).toEqual({ type: 'pong', id: 2 })
   })
 
   test('thread register reuses existing binding for same session_id', async () => {

@@ -32,6 +32,15 @@ export const RegisterErrMsg = z.object({
     'parent_channel_unset',
     'thread_not_allowed',
     'discord_unavailable',
+    // Emitted when persisting the new binding to bindings.json fails after
+    // a successful Discord createThread / verifyThreadParent. Distinct from
+    // discord_unavailable so the shim and operators can tell a disk problem
+    // apart from a Discord API problem.
+    'bindings_save_failed',
+    // Emitted when reading bindings.json fails (e.g. corrupt JSON, EACCES).
+    // Returned per-register-request so a bad file does not bring down the
+    // whole daemon message loop for every other shim.
+    'bindings_load_failed',
   ]),
   message: z.string(),
 })

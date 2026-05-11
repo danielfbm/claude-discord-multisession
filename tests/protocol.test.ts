@@ -42,4 +42,25 @@ describe('protocol', () => {
     })
     expect(m.type).toBe('inbound')
   })
+
+  test('parseDaemonMsg accepts every register_err code the daemon emits', () => {
+    // Regression: when the daemon adds a new register_err code but the
+    // protocol enum is not updated, the shim's parseDaemonMsg() rejects the
+    // frame, the shim treats it as malformed, and the register request hangs
+    // until the 30s timeout. Keep this list in sync with all err sites in
+    // src/daemon.ts (grep "register_err" there).
+    const codes = [
+      'dm_session_taken',
+      'thread_session_taken',
+      'parent_channel_unset',
+      'thread_not_allowed',
+      'discord_unavailable',
+      'bindings_save_failed',
+      'bindings_load_failed',
+    ]
+    for (const code of codes) {
+      const m = parseDaemonMsg({ type: 'register_err', id: 1, code, message: 'x' })
+      expect(m).toMatchObject({ type: 'register_err', code })
+    }
+  })
 })
