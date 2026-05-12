@@ -5,7 +5,7 @@ import { readFrames, writeFrame } from './framing'
 import { parseShimMsg } from './protocol'
 import type { DiscordOps } from './discord-ops'
 import { loadAccess, saveAccess, pruneExpired } from './access'
-import { loadBindings, saveBindings } from './bindings'
+import { loadBindings, upsertBinding } from './bindings'
 import { deriveThreadName } from './session-id'
 import { gate, type GateInput } from './gate'
 
@@ -241,7 +241,26 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
 
         if (msg.type === 'register') {
           const access = loadAccess(accessFile)
-          const bindings = loadBindings(bindingsFile)
+          // Read-only snapshot of bindings; the auto-mode lookup below only
+          // needs to know whether this session was previously bound. Writes
+          // go through upsertBinding(), which re-reads + merges inside a
+          // per-file mutex so this snapshot's staleness cannot lose data.
+          //
+          // Guarded with try/catch because a corrupt or unreadable
+          // bindings.json must NOT take down the entire daemon message loop
+          // — that would punish every other connected shim for one bad file.
+          // The error is reported as bindings_load_failed and only this
+          // register fails.
+          let bindings: ReturnType<typeof loadBindings>
+          try {
+            bindings = loadBindings(bindingsFile)
+          } catch (err) {
+            writeFrame(sock, {
+              type: 'register_err', id: msg.id, code: 'bindings_load_failed',
+              message: `bindings load failed: ${err instanceof Error ? err.message : String(err)}`,
+            })
+            continue
+          }
 
           if (sessions.has(msg.session_id)) {
             writeFrame(sock, {
@@ -252,81 +271,172 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
             continue
           }
 
-          if (msg.mode === 'dm') {
-            if (dmSessionId !== null) {
-              writeFrame(sock, {
-                type: 'register_err', id: msg.id, code: 'dm_session_taken',
-                message: 'a DM-mode shim is already registered',
-              })
-              continue
-            }
-            dmSessionId = msg.session_id
-            sessions.set(msg.session_id, { session_id: msg.session_id, mode: 'dm', thread_id: null, sock })
-            mySessionId = msg.session_id
-            writeFrame(sock, { type: 'register_ack', id: msg.id, session_id: msg.session_id, thread_id: null })
-            continue
-          }
+          // Reserve the session_id synchronously so a concurrent register
+          // with the same session_id (which would otherwise also pass the
+          // sessions.has() check above before any await yields) fails fast
+          // instead of doubly-creating threads + double-acking. The
+          // placeholder uses thread_id=null; inbound routing keys off
+          // threadIndex (still unset) or dmSessionId (also still unset), so
+          // no traffic can land on this half-registered session yet.
+          sessions.set(msg.session_id, { session_id: msg.session_id, mode: msg.mode, thread_id: null, sock })
 
-          // thread mode
-          let threadId = msg.thread_id!
-          if (threadId === 'auto') {
-            const existing = bindings[msg.session_id]
-            if (existing) {
-              threadId = existing.thread_id
-            } else {
-              if (!access.parentChannelId) {
+          // reservedThreadId tracks the thread_id we have synchronously
+          // claimed in threadIndex on behalf of this session, so the
+          // `finally` block can release it on any failure path.
+          let reservedThreadId: string | null = null
+          let committed = false
+          try {
+            if (msg.mode === 'dm') {
+              if (dmSessionId !== null) {
                 writeFrame(sock, {
-                  type: 'register_err', id: msg.id, code: 'parent_channel_unset',
-                  message: 'parentChannelId is not set in access.json',
+                  type: 'register_err', id: msg.id, code: 'dm_session_taken',
+                  message: 'a DM-mode shim is already registered',
                 })
                 continue
               }
-              const name = deriveThreadName(msg.cwd, msg.session_id, msg.thread_name)
-              try {
-                const t = await ops.createThread(access.parentChannelId, name)
-                threadId = t.thread_id
-                bindings[msg.session_id] = {
-                  thread_id: threadId, cwd: msg.cwd,
-                  created_at: Date.now(), last_seen_at: Date.now(),
+              // Send the ack BEFORE claiming dmSessionId / mySessionId. If
+              // writeFrame throws synchronously (e.g. the shim already
+              // disconnected), neither identifier has clean-up logic in the
+              // finally block, so a pre-emptive assignment would permanently
+              // leak the DM slot for the rest of the daemon's lifetime.
+              writeFrame(sock, { type: 'register_ack', id: msg.id, session_id: msg.session_id, thread_id: null })
+              dmSessionId = msg.session_id
+              mySessionId = msg.session_id
+              committed = true
+              continue
+            }
+
+            // thread mode
+            let threadId = msg.thread_id!
+            if (threadId === 'auto') {
+              const existing = bindings[msg.session_id]
+              if (existing) {
+                threadId = existing.thread_id
+                // Reusing a previously-persisted binding. Claim the thread
+                // synchronously to fail fast on a concurrent reuse race.
+                if (threadIndex.has(threadId)) {
+                  writeFrame(sock, {
+                    type: 'register_err', id: msg.id, code: 'thread_session_taken',
+                    message: 'this thread is already bound to another session',
+                  })
+                  continue
                 }
-                saveBindings(bindingsFile, bindings)
+                threadIndex.set(threadId, msg.session_id)
+                reservedThreadId = threadId
+              } else {
+                if (!access.parentChannelId) {
+                  writeFrame(sock, {
+                    type: 'register_err', id: msg.id, code: 'parent_channel_unset',
+                    message: 'parentChannelId is not set in access.json',
+                  })
+                  continue
+                }
+                const name = deriveThreadName(msg.cwd, msg.session_id, msg.thread_name)
+                try {
+                  const t = await ops.createThread(access.parentChannelId, name)
+                  threadId = t.thread_id
+                } catch (err) {
+                  writeFrame(sock, {
+                    type: 'register_err', id: msg.id, code: 'discord_unavailable',
+                    message: `createThread failed: ${err instanceof Error ? err.message : String(err)}`,
+                  })
+                  continue
+                }
+                // Brand-new thread id from Discord — collision impossible,
+                // but claim threadIndex uniformly so cleanup paths are
+                // symmetric.
+                threadIndex.set(threadId, msg.session_id)
+                reservedThreadId = threadId
+                // Persist the new binding. upsertBinding does load-merge-write
+                // inside a per-file mutex; failures surface as a distinct
+                // error code rather than masquerading as a Discord failure.
+                try {
+                  await upsertBinding(bindingsFile, msg.session_id, {
+                    thread_id: threadId, cwd: msg.cwd,
+                    created_at: Date.now(), last_seen_at: Date.now(),
+                  })
+                } catch (err) {
+                  writeFrame(sock, {
+                    type: 'register_err', id: msg.id, code: 'bindings_save_failed',
+                    message: `bindings save failed: ${err instanceof Error ? err.message : String(err)}`,
+                  })
+                  continue
+                }
+              }
+            } else {
+              // Explicit thread snowflake. Claim threadIndex BEFORE persisting
+              // the binding — previously the order was reversed, which left
+              // a stale binding on disk whenever the second registration of
+              // an already-bound thread was rejected.
+              //
+              // Fast-path reject: this pre-await check skips the Discord
+              // verifyThreadParent round-trip when the thread is already
+              // known to be bound. It is an optimization, NOT the
+              // correctness gate — the post-await recheck below is what
+              // actually prevents concurrent claims from racing past us.
+              if (threadIndex.has(threadId)) {
+                writeFrame(sock, {
+                  type: 'register_err', id: msg.id, code: 'thread_session_taken',
+                  message: 'this thread is already bound to another session',
+                })
+                continue
+              }
+              const parent = await ops.verifyThreadParent(threadId)
+              if (!parent || !(parent in access.groups)) {
+                writeFrame(sock, {
+                  type: 'register_err', id: msg.id, code: 'thread_not_allowed',
+                  message: 'thread parent is not opted in via /discord:access group add',
+                })
+                continue
+              }
+              // Recheck post-await: a concurrent register could have claimed
+              // this thread while we were verifying its parent.
+              if (threadIndex.has(threadId)) {
+                writeFrame(sock, {
+                  type: 'register_err', id: msg.id, code: 'thread_session_taken',
+                  message: 'this thread is already bound to another session',
+                })
+                continue
+              }
+              threadIndex.set(threadId, msg.session_id)
+              reservedThreadId = threadId
+              try {
+                await upsertBinding(bindingsFile, msg.session_id, {
+                  thread_id: threadId, cwd: msg.cwd,
+                  created_at: bindings[msg.session_id]?.created_at ?? Date.now(),
+                  last_seen_at: Date.now(),
+                })
               } catch (err) {
                 writeFrame(sock, {
-                  type: 'register_err', id: msg.id, code: 'discord_unavailable',
-                  message: `createThread failed: ${err instanceof Error ? err.message : String(err)}`,
+                  type: 'register_err', id: msg.id, code: 'bindings_save_failed',
+                  message: `bindings save failed: ${err instanceof Error ? err.message : String(err)}`,
                 })
                 continue
               }
             }
-          } else {
-            // Verify the supplied thread snowflake is under an opted-in parent.
-            const parent = await ops.verifyThreadParent(threadId)
-            if (!parent || !(parent in access.groups)) {
-              writeFrame(sock, {
-                type: 'register_err', id: msg.id, code: 'thread_not_allowed',
-                message: 'thread parent is not opted in via /discord:access group add',
-              })
-              continue
-            }
-            bindings[msg.session_id] = {
-              thread_id: threadId, cwd: msg.cwd,
-              created_at: bindings[msg.session_id]?.created_at ?? Date.now(),
-              last_seen_at: Date.now(),
-            }
-            saveBindings(bindingsFile, bindings)
-          }
 
-          if (threadIndex.has(threadId)) {
-            writeFrame(sock, {
-              type: 'register_err', id: msg.id, code: 'thread_session_taken',
-              message: 'this thread is already bound to another session',
-            })
-            continue
+            // Send the ack BEFORE the final commit assignments. If writeFrame
+            // throws synchronously, the finally block still cleans up
+            // `sessions` and `threadIndex` (committed stays false), and
+            // `mySessionId` is never assigned to a now-released session_id.
+            writeFrame(sock, { type: 'register_ack', id: msg.id, session_id: msg.session_id, thread_id: threadId })
+            // Finalize: upgrade the placeholder session entry to the real one
+            // and bind this connection's outbound identity.
+            sessions.set(msg.session_id, { session_id: msg.session_id, mode: 'thread', thread_id: threadId, sock })
+            mySessionId = msg.session_id
+            committed = true
+          } finally {
+            if (!committed) {
+              // Release every reservation we made before the failure point.
+              // `continue` from inside the try block runs this finally before
+              // moving to the next message, so subsequent registers see a
+              // clean state. `dmSessionId` and `mySessionId` are only
+              // assigned after a successful writeFrame, so they cannot leak
+              // here even if writeFrame throws.
+              sessions.delete(msg.session_id)
+              if (reservedThreadId !== null) threadIndex.delete(reservedThreadId)
+            }
           }
-          threadIndex.set(threadId, msg.session_id)
-          sessions.set(msg.session_id, { session_id: msg.session_id, mode: 'thread', thread_id: threadId, sock })
-          mySessionId = msg.session_id
-          writeFrame(sock, { type: 'register_ack', id: msg.id, session_id: msg.session_id, thread_id: threadId })
           continue
         }
 
