@@ -15,9 +15,39 @@ import { getStateDir } from './state-dir'
 const STATE_DIR = getStateDir()
 const SOCK_PATH = join(STATE_DIR, 'daemon.sock')
 const LOG_PATH = join(STATE_DIR, 'daemon.log')
-const THREAD_ENV = process.env.DISCORD_THREAD_ID
-const THREAD_NAME_ENV = process.env.DISCORD_THREAD_NAME
 const SESSION_ID = process.env.CLAUDE_SESSION_ID ?? deriveSessionId(process.cwd())
+
+export type RegisterFields = {
+  mode: 'dm' | 'thread'
+  thread_id?: string
+  thread_name?: string
+}
+
+/**
+ * Derive register-payload fields from environment variables.
+ *
+ * Thread mode is opt-in: only triggered when `DISCORD_THREAD_ID` is set to a
+ * non-empty, non-whitespace value. Anything else — unset, empty string, or
+ * whitespace-only — yields DM mode, so a session that didn't explicitly opt
+ * in never causes the daemon to create or bind a thread.
+ *
+ * `DISCORD_THREAD_NAME` is only forwarded in thread mode; in DM mode it
+ * would be ignored by the daemon anyway, so we drop it to keep the
+ * register payload honest about what was requested.
+ */
+export function deriveRegisterFields(env: NodeJS.ProcessEnv): RegisterFields {
+  const rawThread = env.DISCORD_THREAD_ID
+  const threadId = typeof rawThread === 'string' ? rawThread.trim() : ''
+  if (!threadId) return { mode: 'dm' }
+
+  const rawName = env.DISCORD_THREAD_NAME
+  const threadName = typeof rawName === 'string' ? rawName.trim() : ''
+  return {
+    mode: 'thread',
+    thread_id: threadId,
+    ...(threadName ? { thread_name: threadName } : {}),
+  }
+}
 
 async function tryConnect(): Promise<Socket | null> {
   if (!existsSync(SOCK_PATH)) return null
@@ -219,10 +249,8 @@ export async function runShim(): Promise<void> {
   void readDaemonLoop()
 
   const ack = await send<{ type: 'register_ack' | 'register_err'; code?: string; message?: string }>({
-    type: 'register', id: nextId++, session_id: SESSION_ID,
-    mode: THREAD_ENV ? 'thread' : 'dm', cwd: process.cwd(),
-    ...(THREAD_ENV ? { thread_id: THREAD_ENV } : {}),
-    ...(THREAD_NAME_ENV ? { thread_name: THREAD_NAME_ENV } : {}),
+    type: 'register', id: nextId++, session_id: SESSION_ID, cwd: process.cwd(),
+    ...deriveRegisterFields(process.env),
   })
   if (ack.type !== 'register_ack') {
     process.stderr.write(`discord shim: register failed (${ack.code}): ${ack.message}\n`)
