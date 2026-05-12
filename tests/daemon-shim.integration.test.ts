@@ -335,6 +335,48 @@ describe('daemon: register', () => {
     expect(replyCall.text).toMatch(/[0-9a-f]{6}/)
   })
 
+  test('regression: DM-mode register never calls createThread', async () => {
+    // Even with parentChannelId configured (so the daemon is *capable* of
+    // creating a thread), a shim that registers as DM mode — i.e. did not
+    // set DISCORD_THREAD_ID — must not trigger thread creation.
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.parentChannelId = 'parent-1'
+    a.groups['parent-1'] = { requireMention: true, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), a)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, { type: 'register', id: 1, session_id: 's-dm', mode: 'dm', cwd: '/x' })
+    const ack = await recv(it)
+    expect(ack.type).toBe('register_ack')
+    expect(ack.thread_id).toBeNull()
+    expect(ops.calls.filter(c => c.kind === 'createThread')).toHaveLength(0)
+  })
+
+  test('happy path: thread-mode auto register calls createThread exactly once', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.parentChannelId = 'parent-1'
+    a.groups['parent-1'] = { requireMention: true, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), a)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, {
+      type: 'register', id: 1, session_id: 's-thread',
+      mode: 'thread', cwd: '/repo/x', thread_id: 'auto',
+    })
+    const ack = await recv(it)
+    expect(ack.type).toBe('register_ack')
+    expect(ack.thread_id).toMatch(/^fake-thread-/)
+    expect(ops.calls.filter(c => c.kind === 'createThread')).toHaveLength(1)
+  })
+
   test('thread register reuses existing binding for same session_id', async () => {
     const ops = new FakeDiscordOps()
     const { saveAccess, defaultAccess } = await import('../src/access')
