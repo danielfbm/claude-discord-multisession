@@ -524,6 +524,251 @@ describe('daemon: register', () => {
     expect(pong).toEqual({ type: 'pong', id: 2 })
   })
 
+  // Migration: when CLAUDE_DISCORD_CWD_REWRITE is active on a new machine,
+  // the shim re-keys the binding from sha1(realpath) to sha1(canonical_cwd).
+  // The legacy entry must be renamed to the new key (preserving thread_id
+  // and created_at), gain a canonical_cwd marker, and disappear under the
+  // old key — all atomically before the auto-mode lookup reuses it.
+  test('migrates legacy binding to new key when shim sends legacy_session_id', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.parentChannelId = 'parent-1'
+    a.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), a)
+
+    // Pre-seed a legacy (pre-rewrite) binding directly on disk.
+    const { saveBindings, loadBindings } = await import('../src/bindings')
+    await saveBindings(join(dir, 'bindings.json'), {
+      'legacy-key-12': {
+        thread_id: 'fake-thread-pre-existing',
+        cwd: '/mnt/external/work/proj',
+        created_at: 111,
+        last_seen_at: 222,
+      },
+    })
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, {
+      type: 'register', id: 1, session_id: 'new-key-canon',
+      mode: 'thread', cwd: '/home/u/code/proj', thread_id: 'auto',
+      legacy_session_id: 'legacy-key-12',
+      canonical_cwd: '/home/u/code/proj',
+    })
+    const ack = await recv(it)
+    expect(ack.type).toBe('register_ack')
+    // Critical: the daemon must reuse the migrated thread, not create a new one.
+    expect(ack.thread_id).toBe('fake-thread-pre-existing')
+    expect(ops.calls.find(c => c.kind === 'createThread')).toBeFalsy()
+
+    const onDisk = loadBindings(join(dir, 'bindings.json'))
+    expect(onDisk['legacy-key-12']).toBeUndefined()
+    expect(onDisk['new-key-canon']).toMatchObject({
+      thread_id: 'fake-thread-pre-existing',
+      cwd: '/home/u/code/proj',
+      canonical_cwd: '/home/u/code/proj',
+      created_at: 111, // preserved across migration
+    })
+    expect(onDisk['new-key-canon'].last_seen_at).toBeGreaterThan(222)
+  })
+
+  // Once an entry already has canonical_cwd, the daemon must NOT re-migrate
+  // from a (now-stale) legacy_session_id hint. This guards against
+  // accidentally clobbering a properly-keyed binding on a third-time
+  // register where the shim happens to still report a legacy key.
+  test('skips migration when target entry already has canonical_cwd', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.parentChannelId = 'parent-1'
+    a.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), a)
+
+    const { saveBindings, loadBindings } = await import('../src/bindings')
+    await saveBindings(join(dir, 'bindings.json'), {
+      'new-key': {
+        thread_id: 'fake-thread-already-migrated',
+        cwd: '/home/u/code/proj',
+        canonical_cwd: '/home/u/code/proj',
+        created_at: 111, last_seen_at: 222,
+      },
+      'stale-legacy': {
+        thread_id: 'fake-thread-stale',
+        cwd: '/old/realpath',
+        created_at: 9, last_seen_at: 10,
+      },
+    })
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, {
+      type: 'register', id: 1, session_id: 'new-key',
+      mode: 'thread', cwd: '/home/u/code/proj', thread_id: 'auto',
+      legacy_session_id: 'stale-legacy',
+      canonical_cwd: '/home/u/code/proj',
+    })
+    const ack = await recv(it)
+    expect(ack.type).toBe('register_ack')
+    expect(ack.thread_id).toBe('fake-thread-already-migrated')
+
+    // The stale legacy entry should remain untouched — we don't garbage-
+    // collect entries that aren't ours to migrate. The user can clean
+    // them up manually if needed.
+    const onDisk = loadBindings(join(dir, 'bindings.json'))
+    expect(onDisk['stale-legacy']).toBeDefined()
+    expect(onDisk['stale-legacy'].thread_id).toBe('fake-thread-stale')
+  })
+
+  // Regression: when the legacy session is still live (its thread is held
+  // in threadIndex by another connection), a second register with
+  // legacy_session_id must fail AND leave bindings.json untouched. The
+  // previous design committed the legacy→canonical rename before the
+  // thread claim check, so a thread_session_taken failure here would
+  // delete the legacy key from disk while no Discord-side migration had
+  // actually happened — stranding the still-alive original session.
+  test('does not mutate bindings.json when legacy thread is still claimed', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.parentChannelId = 'parent-1'
+    a.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), a)
+
+    // Pre-seed a legacy binding pointing to a stable thread_id we control.
+    const { saveBindings, loadBindings } = await import('../src/bindings')
+    await saveBindings(join(dir, 'bindings.json'), {
+      'legacy-key': {
+        thread_id: 'thread-still-claimed',
+        cwd: '/old/path',
+        created_at: 111, last_seen_at: 222,
+      },
+    })
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+
+    // session1: register under the legacy key in auto mode. The daemon
+    // reuses the seeded binding and claims `thread-still-claimed` in
+    // threadIndex. The socket stays open so the claim persists when
+    // session2 arrives below.
+    const sock1 = await connect(join(dir, 'daemon.sock'))
+    const it1 = frameIterator(sock1)
+    writeFrame(sock1, {
+      type: 'register', id: 1, session_id: 'legacy-key',
+      mode: 'thread', cwd: '/old/path', thread_id: 'auto',
+    })
+    const ack1 = await recv(it1)
+    expect(ack1.type).toBe('register_ack')
+    expect(ack1.thread_id).toBe('thread-still-claimed')
+
+    // session2: tries to migrate the legacy binding to a new canonical key
+    // while session1 is still holding the thread. Auto-mode resolves
+    // `thread-still-claimed` via the legacy entry, sees the in-memory
+    // claim, and fails. Disk state must be exactly what we seeded.
+    const sock2 = await connect(join(dir, 'daemon.sock'))
+    const it2 = frameIterator(sock2)
+    writeFrame(sock2, {
+      type: 'register', id: 1, session_id: 'new-key-canon',
+      mode: 'thread', cwd: '/home/u/code/proj', thread_id: 'auto',
+      legacy_session_id: 'legacy-key',
+      canonical_cwd: '/home/u/code/proj',
+    })
+    const ack2 = await recv(it2)
+    expect(ack2.type).toBe('register_err')
+    expect(ack2.code).toBe('thread_session_taken')
+
+    const onDisk = loadBindings(join(dir, 'bindings.json'))
+    // Legacy entry exactly as seeded — no rename, no canonical_cwd
+    // injection, no last_seen_at refresh.
+    expect(onDisk['legacy-key']).toEqual({
+      thread_id: 'thread-still-claimed',
+      cwd: '/old/path',
+      created_at: 111, last_seen_at: 222,
+    })
+    expect(onDisk['new-key-canon']).toBeUndefined()
+  })
+
+  // Negative: when the shim happens to send legacy_session_id equal to the
+  // current session_id (a degenerate no-op hint that should never trigger
+  // migration), the daemon must not rewrite the entry under itself or
+  // otherwise touch it. Locks the `legacy_session_id !== session_id` guard
+  // in src/daemon.ts so a future refactor cannot regress it.
+  test('skips migration when legacy_session_id equals session_id', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.parentChannelId = 'parent-1'
+    a.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), a)
+
+    const { saveBindings, loadBindings } = await import('../src/bindings')
+    await saveBindings(join(dir, 'bindings.json'), {
+      'same-key': {
+        thread_id: 'fake-thread-same',
+        cwd: '/home/u/code/proj',
+        created_at: 100, last_seen_at: 200,
+      },
+    })
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, {
+      type: 'register', id: 1, session_id: 'same-key',
+      mode: 'thread', cwd: '/home/u/code/proj', thread_id: 'auto',
+      legacy_session_id: 'same-key',
+      canonical_cwd: '/home/u/code/proj',
+    })
+    const ack = await recv(it)
+    expect(ack.type).toBe('register_ack')
+    expect(ack.thread_id).toBe('fake-thread-same')
+
+    const onDisk = loadBindings(join(dir, 'bindings.json'))
+    // Entry must still be under the same key. created_at must not be
+    // touched (migration would have refreshed last_seen_at; a no-op auto
+    // reuse leaves both timestamps as-is).
+    expect(onDisk['same-key']).toBeDefined()
+    expect(onDisk['same-key'].thread_id).toBe('fake-thread-same')
+    expect(onDisk['same-key'].created_at).toBe(100)
+    // No spurious canonical_cwd was added by a phantom migration.
+    expect('canonical_cwd' in onDisk['same-key']).toBe(false)
+  })
+
+  // Regression: an empty-string canonical_cwd (legitimately produced by a
+  // `/strip-me=` exact-match rewrite) must be persisted on the binding, not
+  // dropped by a truthy check. If it were dropped the entry would look
+  // unmigrated on the next register and self-contained verification would
+  // fail because consumers can't see what was sha1'd.
+  test('persists empty-string canonical_cwd on fresh auto-mode register', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.parentChannelId = 'parent-1'
+    a.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), a)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, {
+      type: 'register', id: 1, session_id: 'sid-empty-canon',
+      mode: 'thread', cwd: '/strip-me', thread_id: 'auto',
+      canonical_cwd: '',
+    })
+    const ack = await recv(it)
+    expect(ack.type).toBe('register_ack')
+
+    const { loadBindings } = await import('../src/bindings')
+    const onDisk = loadBindings(join(dir, 'bindings.json'))
+    expect(onDisk['sid-empty-canon']).toBeDefined()
+    // The field must be present AND equal to '' — `toHaveProperty` plus an
+    // explicit `===` check rejects both "missing field" and "undefined".
+    expect('canonical_cwd' in onDisk['sid-empty-canon']).toBe(true)
+    expect(onDisk['sid-empty-canon'].canonical_cwd).toBe('')
+  })
+
   test('thread register reuses existing binding for same session_id', async () => {
     const ops = new FakeDiscordOps()
     const { saveAccess, defaultAccess } = await import('../src/access')

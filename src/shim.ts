@@ -9,7 +9,7 @@ import { join, resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { readFrames, writeFrame } from './framing'
 import { parseDaemonMsg } from './protocol'
-import { deriveSessionId } from './session-id'
+import { deriveSessionIdInfo } from './session-id'
 import { getStateDir } from './state-dir'
 
 const STATE_DIR = getStateDir()
@@ -17,7 +17,13 @@ const SOCK_PATH = join(STATE_DIR, 'daemon.sock')
 const LOG_PATH = join(STATE_DIR, 'daemon.log')
 const THREAD_ENV = process.env.DISCORD_THREAD_ID
 const THREAD_NAME_ENV = process.env.DISCORD_THREAD_NAME
-const SESSION_ID = process.env.CLAUDE_SESSION_ID ?? deriveSessionId(process.cwd())
+
+// When CLAUDE_SESSION_ID is explicitly pinned, the user is taking full
+// responsibility for the key — we don't apply rewrite or send migration
+// hints, since there's no "old key" to migrate from in that case.
+const SESSION_ID_OVERRIDE = process.env.CLAUDE_SESSION_ID
+const SESSION_INFO = SESSION_ID_OVERRIDE ? null : deriveSessionIdInfo(process.cwd())
+const SESSION_ID = SESSION_ID_OVERRIDE ?? SESSION_INFO!.sessionId
 
 async function tryConnect(): Promise<Socket | null> {
   if (!existsSync(SOCK_PATH)) return null
@@ -218,11 +224,18 @@ export async function runShim(): Promise<void> {
   daemonSock = await connectOrSpawn()
   void readDaemonLoop()
 
+  // Migration hints: only send when rewrite actually changed the path.
+  // For an unset rewrite env (the common case) the wire shape stays
+  // byte-identical to v1, so older daemons keep working unchanged.
+  const migrationHints = SESSION_INFO?.rewriteApplied
+    ? { legacy_session_id: SESSION_INFO.legacySessionId, canonical_cwd: SESSION_INFO.canonicalCwd }
+    : {}
   const ack = await send<{ type: 'register_ack' | 'register_err'; code?: string; message?: string }>({
     type: 'register', id: nextId++, session_id: SESSION_ID,
     mode: THREAD_ENV ? 'thread' : 'dm', cwd: process.cwd(),
     ...(THREAD_ENV ? { thread_id: THREAD_ENV } : {}),
     ...(THREAD_NAME_ENV ? { thread_name: THREAD_NAME_ENV } : {}),
+    ...migrationHints,
   })
   if (ack.type !== 'register_ack') {
     process.stderr.write(`discord shim: register failed (${ack.code}): ${ack.message}\n`)

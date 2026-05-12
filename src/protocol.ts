@@ -8,6 +8,20 @@ export const RegisterMsg = z.object({
   cwd: z.string(),
   thread_id: z.string().optional(),
   thread_name: z.string().optional(),
+  /**
+   * Pre-rewrite key (sha1 of realpath only). Present iff the shim
+   * applied CLAUDE_DISCORD_CWD_REWRITE and the resulting session_id
+   * differs from the legacy hash. The daemon uses this to migrate a
+   * pre-rewrite binding to the new key on first re-register, so users
+   * keep their thread across the rule change.
+   */
+  legacy_session_id: z.string().optional(),
+  /**
+   * The rewritten path that the new session_id was sha1'd from. Stored
+   * verbatim on the binding so the key can be re-verified later without
+   * needing the env var configured (or even the path to exist locally).
+   */
+  canonical_cwd: z.string().optional(),
 }).superRefine((v, ctx) => {
   if (v.mode === 'thread' && !v.thread_id) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'thread_id required when mode=thread' })
@@ -41,6 +55,11 @@ export const RegisterErrMsg = z.object({
     // Returned per-register-request so a bad file does not bring down the
     // whole daemon message loop for every other shim.
     'bindings_load_failed',
+    // Emitted when the legacy→canonical key migration fails (a rare path:
+    // disk write error inside migrateBindingKey). Kept distinct from
+    // bindings_save_failed so log greps can tell the two write paths apart
+    // during incident response.
+    'bindings_migrate_failed',
   ]),
   message: z.string(),
 })

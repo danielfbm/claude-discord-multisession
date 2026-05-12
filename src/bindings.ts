@@ -6,6 +6,13 @@ export type BindingEntry = {
   cwd: string
   created_at: number
   last_seen_at: number
+  /**
+   * The path that was actually sha1'd to produce this binding's key.
+   * Present iff CLAUDE_DISCORD_CWD_REWRITE rewrote `cwd` at register
+   * time. Absence implies the legacy contract (key = sha1(cwd)) and
+   * doubles as the "this entry has not been migrated yet" marker.
+   */
+  canonical_cwd?: string
 }
 
 export type Bindings = Record<string, BindingEntry>
@@ -89,6 +96,44 @@ export function upsertBinding(file: string, sessionId: string, entry: BindingEnt
   return enqueue(file, () => {
     const current = loadBindings(file)
     current[sessionId] = snapshot
+    writeAtomic(file, JSON.stringify(current, null, 2) + '\n')
+  })
+}
+
+/**
+ * Rename a binding key from `oldKey` to `newKey` and merge `patch` onto
+ * the entry, atomically inside the same per-file critical section as
+ * upsertBinding. Used by the daemon to migrate pre-rewrite entries to
+ * the new canonical_cwd-keyed shape on first re-register.
+ *
+ * Semantics:
+ *   - If neither key exists, no-op.
+ *   - If newKey already exists, the legacy oldKey is dropped (the new
+ *     entry wins; we assume the caller already vetted that newKey is
+ *     the intended live record).
+ *   - If only oldKey exists, the entry is copied to newKey with `patch`
+ *     fields shallow-merged on top, then oldKey is deleted.
+ */
+export function migrateBindingKey(
+  file: string,
+  oldKey: string,
+  newKey: string,
+  patch: Partial<BindingEntry>,
+): Promise<void> {
+  // Snapshot patch fields at call time for the same reason as upsertBinding.
+  const patchSnapshot: Partial<BindingEntry> = { ...patch }
+  return enqueue(file, () => {
+    const current = loadBindings(file)
+    const legacy = current[oldKey]
+    if (!legacy) return
+    if (current[newKey]) {
+      // newKey already authoritative — just drop the stale legacy entry.
+      delete current[oldKey]
+      writeAtomic(file, JSON.stringify(current, null, 2) + '\n')
+      return
+    }
+    current[newKey] = { ...legacy, ...patchSnapshot }
+    delete current[oldKey]
     writeAtomic(file, JSON.stringify(current, null, 2) + '\n')
   })
 }

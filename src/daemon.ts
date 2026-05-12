@@ -5,7 +5,7 @@ import { readFrames, writeFrame } from './framing'
 import { parseShimMsg } from './protocol'
 import type { DiscordOps } from './discord-ops'
 import { loadAccess, saveAccess, pruneExpired } from './access'
-import { loadBindings, upsertBinding } from './bindings'
+import { loadBindings, upsertBinding, migrateBindingKey } from './bindings'
 import { deriveThreadName } from './session-id'
 import { gate, type GateInput } from './gate'
 
@@ -50,6 +50,29 @@ type Session = {
   mode: 'dm' | 'thread'
   thread_id: string | null
   sock: Socket
+}
+
+// Single-line key=value log emitted for every register attempt so daemon.log
+// answers "which shim wrote this bindings.json entry, when, with which cwd
+// and thread_id" without needing to cross-reference jsonl mtimes. Format is
+// `discord daemon: register <k>=<v> ...` — matches the existing stderr
+// prefix so `grep "register outcome=" daemon.log` works.
+//
+// Quoting trigger: empty strings (so `canonical_cwd=""` is visually distinct
+// from a missing field), strings containing whitespace / `"` / newlines (so
+// one register can't accidentally span multiple log lines and break the
+// grep contract documented in README). Numeric / id fields stay unquoted
+// for human scannability.
+function logRegister(fields: Record<string, unknown>): void {
+  const parts: string[] = []
+  for (const [k, v] of Object.entries(fields)) {
+    if (v === undefined || v === null) continue
+    const needsQuote = typeof v === 'string'
+      && (v === '' || /[\s"]/.test(v))
+    const s = needsQuote ? JSON.stringify(v) : String(v)
+    parts.push(`${k}=${s}`)
+  }
+  process.stderr.write(`discord daemon: register ${parts.join(' ')}\n`)
 }
 
 async function probeStaleSocket(sockPath: string): Promise<void> {
@@ -255,19 +278,59 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
           try {
             bindings = loadBindings(bindingsFile)
           } catch (err) {
-            writeFrame(sock, {
-              type: 'register_err', id: msg.id, code: 'bindings_load_failed',
-              message: `bindings load failed: ${err instanceof Error ? err.message : String(err)}`,
-            })
+            const message = `bindings load failed: ${err instanceof Error ? err.message : String(err)}`
+            writeFrame(sock, { type: 'register_err', id: msg.id, code: 'bindings_load_failed', message })
+            logRegister({ outcome: 'err', mode: msg.mode, session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, code: 'bindings_load_failed', message })
             continue
           }
 
+          // One-shot legacy→canonical migration is *planned* here but
+          // *committed* further down, after every check that could fail
+          // this register has passed. The previous design committed the
+          // migration at this point, which left bindings.json mutated
+          // whenever a subsequent check rejected the register (most
+          // visibly: an in-memory threadIndex collision when the legacy
+          // session was still live on another connection). After such a
+          // failure the legacy key was gone from disk but no Discord
+          // effect had taken place, leaving callers stranded.
+          //
+          // Planning conditions (all of which must hold for migration
+          // to even be eligible):
+          //   - shim explicitly opted in via legacy_session_id + canonical_cwd
+          //   - mode === 'thread' (DM never reads/writes bindings)
+          //   - the legacy and new keys differ (degenerate hint guard)
+          //   - the new key has no live binding yet
+          //   - the legacy binding still lacks canonical_cwd (i.e. has
+          //     not already been migrated by a prior register)
+          //
+          // The canonical_cwd presence guard prevents a buggy client
+          // from causing repeated re-migrations: without it, the merged
+          // patch would record `canonical_cwd: undefined`, JSON.stringify
+          // would omit it, and the next register would think the entry
+          // is pre-migration again.
+          const migrationLegacyKey: string | undefined =
+            msg.legacy_session_id
+            && msg.canonical_cwd !== undefined
+            && msg.mode === 'thread'
+            && msg.legacy_session_id !== msg.session_id
+            && !bindings[msg.session_id]
+            && bindings[msg.legacy_session_id]
+            && bindings[msg.legacy_session_id].canonical_cwd === undefined
+              ? msg.legacy_session_id
+              : undefined
+
+          // Effective view of "the binding to inherit from". When a
+          // migration is planned, the legacy entry stands in for
+          // bindings[msg.session_id] for the rest of this register.
+          // Reads only — the disk rename happens at commit time.
+          const inheritedBinding = bindings[msg.session_id]
+            ?? (migrationLegacyKey ? bindings[migrationLegacyKey] : undefined)
+
           if (sessions.has(msg.session_id)) {
-            writeFrame(sock, {
-              type: 'register_err', id: msg.id,
-              code: msg.mode === 'dm' ? 'dm_session_taken' : 'thread_session_taken',
-              message: 'this session_id is already registered',
-            })
+            const code = msg.mode === 'dm' ? 'dm_session_taken' : 'thread_session_taken'
+            const message = 'this session_id is already registered'
+            writeFrame(sock, { type: 'register_err', id: msg.id, code, message })
+            logRegister({ outcome: 'err', mode: msg.mode, session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, code, message })
             continue
           }
 
@@ -285,13 +348,17 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
           // `finally` block can release it on any failure path.
           let reservedThreadId: string | null = null
           let committed = false
+          // reuseFlag distinguishes "we reused an existing bindings.json
+          // entry" from "we just created (or are re-claiming via explicit
+          // thread_id) the binding now". Set per branch, logged once at the
+          // single thread-mode success site below.
+          let reuseFlag = false
           try {
             if (msg.mode === 'dm') {
               if (dmSessionId !== null) {
-                writeFrame(sock, {
-                  type: 'register_err', id: msg.id, code: 'dm_session_taken',
-                  message: 'a DM-mode shim is already registered',
-                })
+                const errMessage = 'a DM-mode shim is already registered'
+                writeFrame(sock, { type: 'register_err', id: msg.id, code: 'dm_session_taken', message: errMessage })
+                logRegister({ outcome: 'err', mode: 'dm', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, code: 'dm_session_taken', message: errMessage })
                 continue
               }
               // Send the ack BEFORE claiming dmSessionId / mySessionId. If
@@ -300,6 +367,7 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
               // finally block, so a pre-emptive assignment would permanently
               // leak the DM slot for the rest of the daemon's lifetime.
               writeFrame(sock, { type: 'register_ack', id: msg.id, session_id: msg.session_id, thread_id: null })
+              logRegister({ outcome: 'ok', mode: 'dm', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: null })
               dmSessionId = msg.session_id
               mySessionId = msg.session_id
               committed = true
@@ -309,26 +377,31 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
             // thread mode
             let threadId = msg.thread_id!
             if (threadId === 'auto') {
-              const existing = bindings[msg.session_id]
+              // `inheritedBinding` already folds in the migration-pending
+              // legacy entry, so this branch transparently handles both
+              // plain reuse and "legacy entry waiting to be migrated".
+              const existing = inheritedBinding
               if (existing) {
                 threadId = existing.thread_id
                 // Reusing a previously-persisted binding. Claim the thread
                 // synchronously to fail fast on a concurrent reuse race.
+                // If the claim fails here, no disk write has occurred yet —
+                // the deferred migration further down is skipped because
+                // we `continue` straight to the per-register finally block.
                 if (threadIndex.has(threadId)) {
-                  writeFrame(sock, {
-                    type: 'register_err', id: msg.id, code: 'thread_session_taken',
-                    message: 'this thread is already bound to another session',
-                  })
+                  const errMessage = 'this thread is already bound to another session'
+                  writeFrame(sock, { type: 'register_err', id: msg.id, code: 'thread_session_taken', message: errMessage })
+                  logRegister({ outcome: 'err', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: threadId, code: 'thread_session_taken', message: errMessage })
                   continue
                 }
                 threadIndex.set(threadId, msg.session_id)
                 reservedThreadId = threadId
+                reuseFlag = true
               } else {
                 if (!access.parentChannelId) {
-                  writeFrame(sock, {
-                    type: 'register_err', id: msg.id, code: 'parent_channel_unset',
-                    message: 'parentChannelId is not set in access.json',
-                  })
+                  const errMessage = 'parentChannelId is not set in access.json'
+                  writeFrame(sock, { type: 'register_err', id: msg.id, code: 'parent_channel_unset', message: errMessage })
+                  logRegister({ outcome: 'err', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, code: 'parent_channel_unset', message: errMessage })
                   continue
                 }
                 const name = deriveThreadName(msg.cwd, msg.session_id, msg.thread_name)
@@ -336,10 +409,9 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
                   const t = await ops.createThread(access.parentChannelId, name)
                   threadId = t.thread_id
                 } catch (err) {
-                  writeFrame(sock, {
-                    type: 'register_err', id: msg.id, code: 'discord_unavailable',
-                    message: `createThread failed: ${err instanceof Error ? err.message : String(err)}`,
-                  })
+                  const errMessage = `createThread failed: ${err instanceof Error ? err.message : String(err)}`
+                  writeFrame(sock, { type: 'register_err', id: msg.id, code: 'discord_unavailable', message: errMessage })
+                  logRegister({ outcome: 'err', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, code: 'discord_unavailable', message: errMessage })
                   continue
                 }
                 // Brand-new thread id from Discord — collision impossible,
@@ -354,14 +426,19 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
                   await upsertBinding(bindingsFile, msg.session_id, {
                     thread_id: threadId, cwd: msg.cwd,
                     created_at: Date.now(), last_seen_at: Date.now(),
+                    // Presence check, not truthy: an empty-string
+                    // canonical_cwd is legitimate (e.g. a `/strip-me=`
+                    // rewrite of an exactly-matching path) and must be
+                    // persisted so self-contained verification works.
+                    ...(msg.canonical_cwd !== undefined ? { canonical_cwd: msg.canonical_cwd } : {}),
                   })
                 } catch (err) {
-                  writeFrame(sock, {
-                    type: 'register_err', id: msg.id, code: 'bindings_save_failed',
-                    message: `bindings save failed: ${err instanceof Error ? err.message : String(err)}`,
-                  })
+                  const errMessage = `bindings save failed: ${err instanceof Error ? err.message : String(err)}`
+                  writeFrame(sock, { type: 'register_err', id: msg.id, code: 'bindings_save_failed', message: errMessage })
+                  logRegister({ outcome: 'err', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: threadId, code: 'bindings_save_failed', message: errMessage })
                   continue
                 }
+                // reuseFlag stays false: this is a brand-new binding.
               }
             } else {
               // Explicit thread snowflake. Claim threadIndex BEFORE persisting
@@ -375,42 +452,86 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
               // correctness gate — the post-await recheck below is what
               // actually prevents concurrent claims from racing past us.
               if (threadIndex.has(threadId)) {
-                writeFrame(sock, {
-                  type: 'register_err', id: msg.id, code: 'thread_session_taken',
-                  message: 'this thread is already bound to another session',
-                })
+                const errMessage = 'this thread is already bound to another session'
+                writeFrame(sock, { type: 'register_err', id: msg.id, code: 'thread_session_taken', message: errMessage })
+                logRegister({ outcome: 'err', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: threadId, code: 'thread_session_taken', message: errMessage })
                 continue
               }
               const parent = await ops.verifyThreadParent(threadId)
               if (!parent || !(parent in access.groups)) {
-                writeFrame(sock, {
-                  type: 'register_err', id: msg.id, code: 'thread_not_allowed',
-                  message: 'thread parent is not opted in via /discord:access group add',
-                })
+                const errMessage = 'thread parent is not opted in via /discord:access group add'
+                writeFrame(sock, { type: 'register_err', id: msg.id, code: 'thread_not_allowed', message: errMessage })
+                logRegister({ outcome: 'err', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: threadId, code: 'thread_not_allowed', message: errMessage })
                 continue
               }
               // Recheck post-await: a concurrent register could have claimed
               // this thread while we were verifying its parent.
               if (threadIndex.has(threadId)) {
-                writeFrame(sock, {
-                  type: 'register_err', id: msg.id, code: 'thread_session_taken',
-                  message: 'this thread is already bound to another session',
-                })
+                const errMessage = 'this thread is already bound to another session'
+                writeFrame(sock, { type: 'register_err', id: msg.id, code: 'thread_session_taken', message: errMessage })
+                logRegister({ outcome: 'err', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: threadId, code: 'thread_session_taken', message: errMessage })
                 continue
               }
               threadIndex.set(threadId, msg.session_id)
               reservedThreadId = threadId
+              // Explicit thread_id can be either a fresh claim or a re-bind
+              // of an existing entry — distinguish via `inheritedBinding`,
+              // which includes a migration-pending legacy entry so the
+              // re-bind path preserves its created_at across the rename.
+              reuseFlag = inheritedBinding !== undefined
               try {
+                // Presence check (!== undefined) instead of truthy so an
+                // empty-string canonical_cwd is preserved through both the
+                // fresh-from-msg path and the fallback that inherits the
+                // previous binding's value. Truthy checks here would silently
+                // drop legitimate '' values produced by exact-match rules
+                // like `/strip-me=`.
+                const canonicalToPersist = msg.canonical_cwd !== undefined
+                  ? msg.canonical_cwd
+                  : inheritedBinding?.canonical_cwd
                 await upsertBinding(bindingsFile, msg.session_id, {
                   thread_id: threadId, cwd: msg.cwd,
-                  created_at: bindings[msg.session_id]?.created_at ?? Date.now(),
+                  created_at: inheritedBinding?.created_at ?? Date.now(),
                   last_seen_at: Date.now(),
+                  ...(canonicalToPersist !== undefined ? { canonical_cwd: canonicalToPersist } : {}),
                 })
               } catch (err) {
-                writeFrame(sock, {
-                  type: 'register_err', id: msg.id, code: 'bindings_save_failed',
-                  message: `bindings save failed: ${err instanceof Error ? err.message : String(err)}`,
+                const errMessage = `bindings save failed: ${err instanceof Error ? err.message : String(err)}`
+                writeFrame(sock, { type: 'register_err', id: msg.id, code: 'bindings_save_failed', message: errMessage })
+                logRegister({ outcome: 'err', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: threadId, code: 'bindings_save_failed', message: errMessage })
+                continue
+              }
+            }
+
+            // Deferred migration commit. By the time we reach here, every
+            // possibly-failing check (thread claim, parent verify, fresh
+            // upsert) has succeeded — committing the legacy→canonical
+            // rename now means we won't leave bindings.json mutated under
+            // a failed register, which was the bug that motivated this
+            // ordering.
+            //
+            // For auto-reuse the rename + patch lands the canonical_cwd,
+            // cwd, and last_seen_at refresh that upsertBinding skipped on
+            // this path. For explicit-thread the upsertBinding above has
+            // already written msg.session_id, so migrateBindingKey falls
+            // into its "newKey already exists" branch and just deletes
+            // the now-stale legacy entry.
+            //
+            // The non-null assertion on msg.canonical_cwd is gated by the
+            // migrationLegacyKey computation above (which required
+            // canonical_cwd !== undefined).
+            if (migrationLegacyKey) {
+              try {
+                await migrateBindingKey(bindingsFile, migrationLegacyKey, msg.session_id, {
+                  canonical_cwd: msg.canonical_cwd!,
+                  cwd: msg.cwd,
+                  last_seen_at: Date.now(),
                 })
+                logRegister({ outcome: 'migrate', mode: msg.mode, session_id: msg.session_id, legacy_session_id: migrationLegacyKey, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd })
+              } catch (err) {
+                const errMessage = `bindings migrate failed: ${err instanceof Error ? err.message : String(err)}`
+                writeFrame(sock, { type: 'register_err', id: msg.id, code: 'bindings_migrate_failed', message: errMessage })
+                logRegister({ outcome: 'err', mode: 'thread', session_id: msg.session_id, legacy_session_id: migrationLegacyKey, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: threadId, code: 'bindings_migrate_failed', message: errMessage })
                 continue
               }
             }
@@ -420,6 +541,7 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
             // `sessions` and `threadIndex` (committed stays false), and
             // `mySessionId` is never assigned to a now-released session_id.
             writeFrame(sock, { type: 'register_ack', id: msg.id, session_id: msg.session_id, thread_id: threadId })
+            logRegister({ outcome: 'ok', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: threadId, reuse: reuseFlag })
             // Finalize: upgrade the placeholder session entry to the real one
             // and bind this connection's outbound identity.
             sessions.set(msg.session_id, { session_id: msg.session_id, mode: 'thread', thread_id: threadId, sock })

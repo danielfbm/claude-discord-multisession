@@ -2,7 +2,13 @@ import { test, expect, describe, beforeEach, afterEach } from 'bun:test'
 import { mkdtempSync, rmSync, statSync, writeFileSync, readdirSync, existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { loadBindings, saveBindings, upsertBinding, type Bindings } from '../src/bindings'
+import {
+  loadBindings,
+  saveBindings,
+  upsertBinding,
+  migrateBindingKey,
+  type Bindings,
+} from '../src/bindings'
 
 let dir: string
 let file: string
@@ -160,6 +166,53 @@ describe('bindings', () => {
     // Even when an external edit lands between two queued upserts, the second
     // upsert re-reads inside its critical section and merges on top of the
     // latest disk state.
+    test('migrateBindingKey renames legacy entry and merges patch', async () => {
+      // Seed a legacy-style entry (no canonical_cwd).
+      await upsertBinding(file, 'legacy-key', {
+        thread_id: 't-old', cwd: '/old/path', created_at: 100, last_seen_at: 200,
+      })
+      await migrateBindingKey(file, 'legacy-key', 'new-key', {
+        canonical_cwd: '/canonical/path',
+        cwd: '/new/path',
+        last_seen_at: 999,
+      })
+      const onDisk = loadBindings(file)
+      expect(onDisk['legacy-key']).toBeUndefined()
+      expect(onDisk['new-key']).toEqual({
+        thread_id: 't-old',
+        cwd: '/new/path',
+        canonical_cwd: '/canonical/path',
+        created_at: 100, // preserved
+        last_seen_at: 999, // overridden by patch
+      })
+    })
+
+    test('migrateBindingKey is a no-op when legacy key absent', async () => {
+      await upsertBinding(file, 'unrelated', {
+        thread_id: 't', cwd: '/u', created_at: 1, last_seen_at: 2,
+      })
+      await migrateBindingKey(file, 'never-existed', 'new-key', {})
+      expect(loadBindings(file)).toEqual({
+        unrelated: { thread_id: 't', cwd: '/u', created_at: 1, last_seen_at: 2 },
+      })
+    })
+
+    test('migrateBindingKey drops legacy when new key already exists', async () => {
+      // The "both exist" case: trust the new key as authoritative and just
+      // garbage-collect the stale legacy entry so it doesn't shadow forever.
+      await saveBindings(file, {
+        legacy: { thread_id: 't-leg', cwd: '/l', created_at: 1, last_seen_at: 2 },
+        canon: { thread_id: 't-can', cwd: '/c', created_at: 3, last_seen_at: 4, canonical_cwd: '/c' },
+      })
+      await migrateBindingKey(file, 'legacy', 'canon', { last_seen_at: 999 })
+      const onDisk = loadBindings(file)
+      expect(onDisk.legacy).toBeUndefined()
+      // canon is untouched — the patch is only meant for fresh migrations.
+      expect(onDisk.canon).toEqual({
+        thread_id: 't-can', cwd: '/c', created_at: 3, last_seen_at: 4, canonical_cwd: '/c',
+      })
+    })
+
     test('mid-flight external edit between upserts is preserved', async () => {
       await upsertBinding(file, 'first', {
         thread_id: 't1', cwd: '/1', created_at: 1, last_seen_at: 2,

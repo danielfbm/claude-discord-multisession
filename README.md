@@ -213,7 +213,9 @@ To start fresh in a working directory — new thread for the same cwd —
 remove the session entry from `bindings.json`:
 
 ```sh
-# session_id is sha1(realpath(cwd)).slice(0, 12)
+# session_id is sha1(canonical_cwd or realpath(cwd))[:12]; see
+# scripts/derive-binding-key.sh for the exact derivation, including
+# CLAUDE_DISCORD_CWD_REWRITE handling.
 jq 'del(."<session_id>")' ~/.claude/channels/discord/bindings.json \
   > /tmp/b.json && mv /tmp/b.json ~/.claude/channels/discord/bindings.json
 ```
@@ -233,6 +235,58 @@ Session identity: `sha1(realpath(launch_cwd))[:12]`. One CC per cwd.
 Permission prompts in a thread session post inside the bound thread (so the
 human can answer in-context). The DM session keeps fanning prompts to all
 DMs in `allowFrom`.
+
+### Cross-machine cwd portability
+
+By default the session_id is `sha1(realpath(cwd))[:12]`, so the same logical
+project hashes differently on machines whose paths diverge — e.g. a project
+checked out at `/mnt/external-ssd/work/foo` on the desktop and at
+`/home/me/work/foo` on the laptop. That means the second machine would
+create a brand-new Discord thread instead of reusing the existing one.
+
+Set `CLAUDE_DISCORD_CWD_REWRITE` to make the hash stable. The shim applies
+literal prefix rewrites at directory boundaries before hashing:
+
+```sh
+# Format: "<from1>=<to1>,<from2>=<to2>"
+export CLAUDE_DISCORD_CWD_REWRITE="/mnt/external-ssd/work=$HOME/work"
+```
+
+With this set, both `/mnt/external-ssd/work/foo` and `$HOME/work/foo`
+sha1 the same canonical path and reuse the same thread.
+
+Notes:
+
+- **Backward compatible.** When the env is unset, behavior is byte-identical
+  to v1 — no rewrite is applied and no extra fields are written to
+  `bindings.json`.
+- **One-shot migration.** When the env first becomes active for a cwd that
+  already had a binding, the daemon renames the existing entry from the
+  pre-rewrite key to the new key on the next register, preserving
+  `thread_id`, `created_at`, and the Discord thread itself. The old key
+  disappears from `bindings.json`.
+- **Self-contained verification.** Migrated entries gain a `canonical_cwd`
+  field that records the exact string that was sha1'd. Any consumer can
+  verify the key without needing the env var configured locally — useful
+  for inspecting `bindings.json` on a machine that doesn't share the
+  rewrite rules.
+- **Don't hand-edit `canonical_cwd`.** Removing the field on a migrated
+  entry causes the next register to treat it as pre-migration and run the
+  migration logic again, which may not be what you want. To reset a
+  binding, delete the whole entry instead of stripping the field.
+- **Match semantics.** `from` only matches at a directory boundary (the
+  realpath equals `from` exactly, or starts with `from + '/'`). No
+  mid-component substitution — `/long/path` does not match `/long/path-x`.
+- **Rewrite to `/` is special-cased.** When `to` is the root, descendants
+  of `from` keep their suffix as-is so the canonical path stays valid —
+  `/mnt/ssd=/` applied to `/mnt/ssd/foo` yields `/foo`, not `//foo`. The
+  exact-match case still returns `/`.
+- **Longest prefix wins** when multiple rules could match. Malformed
+  segments (no `=`, blank `from`, bare `/`) are silently skipped — the
+  shim degrades to legacy hashing rather than crashing on a typo.
+- **`CLAUDE_SESSION_ID` overrides everything.** If the user pins the
+  session_id explicitly, rewrite rules are not consulted and no migration
+  hints are sent.
 
 ## Access control
 
@@ -283,6 +337,23 @@ to `$DISCORD_STATE_DIR`, then `$CLAUDE_CONFIG_DIR/channels/discord`, then
 
 If `daemon.log` is empty, the daemon never spawned — verify `bun` is on
 `$PATH` and the cache install dir has a populated `node_modules/`.
+
+### Tracing a `bindings.json` entry
+
+Every register attempt now emits a single key=value line into `daemon.log`,
+so any entry in `bindings.json` is traceable back to the shim that wrote it:
+
+```sh
+grep "register outcome=" ~/.claude/channels/discord/daemon.log
+# discord daemon: register outcome=ok mode=thread session_id=... cwd=... thread_id=... reuse=false
+# discord daemon: register outcome=err  ... code=thread_session_taken message="..."
+# discord daemon: register outcome=migrate ... legacy_session_id=...
+```
+
+`reuse=true` means the daemon re-bound a previously-persisted entry instead
+of creating a fresh Discord thread. If a binding shows up that you cannot
+recall creating, grep the log for its `session_id` to see the original
+register frame's `cwd` and timestamp.
 
 ## License
 
