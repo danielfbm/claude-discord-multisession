@@ -34,6 +34,15 @@ export type Access = {
    * during MCP server construction.
    */
   reactionGuidance?: boolean
+  /**
+   * Opt-in to the PreToolUse hook that intercepts the model's built-in
+   * AskUserQuestion and renders the question over Discord. Default false.
+   * The hook denies the tool call and supplies the user's answer as the
+   * deny reason — that's the only short-circuit the hook contract exposes,
+   * so transcripts of intercepted calls show as denied-with-prose-answer.
+   * When false, the hook prints `{}` and Claude Code's built-in UI runs.
+   */
+  askUserQuestionHook?: boolean
 }
 
 export function defaultAccess(): Access {
@@ -62,6 +71,7 @@ export function loadAccess(file: string): Access {
       chunkMode: parsed.chunkMode,
       parentChannelId: parsed.parentChannelId,
       reactionGuidance: parsed.reactionGuidance,
+      askUserQuestionHook: parsed.askUserQuestionHook,
     }
   } catch {
     try { renameSync(file, `${file}.corrupt-${Date.now()}`) } catch {}

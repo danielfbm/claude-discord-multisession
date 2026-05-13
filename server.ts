@@ -20,6 +20,9 @@
 if (process.argv.includes('--daemon')) {
   const { runDaemon } = await import('./src/daemon-entry')
   await runDaemon()
+} else if (process.argv.includes('--ask-hook')) {
+  const { runAskHook } = await import('./src/ask-hook')
+  await runAskHook()
 } else {
   const { runShim } = await import('./src/shim')
   await runShim()

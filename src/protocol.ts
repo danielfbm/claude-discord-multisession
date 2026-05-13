@@ -67,8 +67,36 @@ export const RegisterErrMsg = z.object({
 export const ToolCallMsg = z.object({
   type: z.literal('tool_call'),
   id: z.number(),
-  name: z.enum(['reply', 'react', 'edit_message', 'fetch_messages', 'download_attachment']),
+  name: z.enum(['reply', 'react', 'edit_message', 'fetch_messages', 'download_attachment', 'discord_ask']),
   args: z.record(z.string(), z.unknown()),
+})
+
+export const AskQuestionSchema = z.object({
+  question: z.string().min(1),
+  header: z.string().optional(),
+  options: z.array(z.object({
+    label: z.string().min(1),
+    description: z.string().optional(),
+  })).min(1).max(20),
+  multiSelect: z.boolean().optional(),
+})
+export type AskQuestion = z.infer<typeof AskQuestionSchema>
+
+export const HookAskMsg = z.object({
+  type: z.literal('hook_ask'),
+  id: z.number(),
+  session_id: z.string(),
+  questions: z.array(AskQuestionSchema).min(1).max(4),
+  timeout_ms: z.number().optional(),
+})
+
+export const HookAskResultMsg = z.object({
+  type: z.literal('hook_ask_result'),
+  id: z.number(),
+  ok: z.boolean(),
+  answers: z.array(z.union([z.string(), z.array(z.string())])).optional(),
+  notes: z.array(z.string().optional()).optional(),
+  error: z.string().optional(),
 })
 
 export const ToolResultMsg = z.object({
@@ -110,10 +138,10 @@ export const PingMsg = z.object({ type: z.literal('ping'), id: z.number() })
 export const PongMsg = z.object({ type: z.literal('pong'), id: z.number() })
 
 const ShimUnion = z.union([
-  RegisterMsg, ToolCallMsg, PermissionRequestMsg, UnregisterMsg, PingMsg,
+  RegisterMsg, ToolCallMsg, PermissionRequestMsg, UnregisterMsg, PingMsg, HookAskMsg,
 ])
 const DaemonUnion = z.union([
-  RegisterAckMsg, RegisterErrMsg, ToolResultMsg, PermissionDecisionMsg, InboundMsg, PongMsg,
+  RegisterAckMsg, RegisterErrMsg, ToolResultMsg, PermissionDecisionMsg, InboundMsg, PongMsg, HookAskResultMsg,
 ])
 
 export type ShimMsg = z.infer<typeof ShimUnion>

@@ -800,4 +800,188 @@ describe('daemon: register', () => {
     expect(ack2.type).toBe('register_ack')
     expect(ops.calls.filter(c => c.kind === 'createThread')).toHaveLength(1)
   })
+
+  test('discord_ask in thread mode uses the parent group allowFrom (not DM allowFrom)', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.parentChannelId = 'parent-1'
+    a.groups['parent-1'] = { requireMention: false, allowFrom: ['thread-user-a', 'thread-user-b'] }
+    a.allowFrom = ['user-dm-only']
+    saveAccess(join(dir, 'access.json'), a)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, { type: 'register', id: 1, session_id: 'ask-t', mode: 'thread', cwd: '/x', thread_id: 'auto' })
+    const ack = await recv(it)
+    expect(ack.type).toBe('register_ack')
+    const threadId = ack.thread_id
+
+    writeFrame(sock, {
+      type: 'tool_call', id: 2, name: 'discord_ask',
+      args: {
+        questions: [
+          { question: 'Pick a backend', options: [{ label: 'Go' }, { label: 'Rust' }] },
+          { question: 'How many shards?', multiSelect: true, options: [{ label: 'one' }, { label: 'two' }, { label: 'three' }] },
+        ],
+      },
+    })
+
+    await new Promise(r => setTimeout(r, 30))
+    const askCall = ops.calls.find(c => c.kind === 'ask') as any
+    expect(askCall).toBeTruthy()
+    expect(askCall.route).toEqual({ kind: 'thread', chat_id: threadId })
+    expect(askCall.allowFrom).toEqual(['thread-user-a', 'thread-user-b'])
+    ops.resolveAsk(askCall.request_id, {
+      answers: [{ selection: 'Rust' }, { selection: ['two', 'three'], notes: undefined }],
+    })
+
+    const result = await recv(it)
+    expect(result.type).toBe('tool_result')
+    expect(result.id).toBe(2)
+    expect(result.isError).toBeUndefined()
+    expect(result.content[0].text).toMatch(/Q1: Rust/)
+    expect(result.content[0].text).toMatch(/Q2: two, three/)
+  })
+
+  test('discord_ask in thread mode with open group allowFrom passes empty allowFrom (no restriction)', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.parentChannelId = 'parent-1'
+    a.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    a.allowFrom = ['user-x']
+    saveAccess(join(dir, 'access.json'), a)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, { type: 'register', id: 1, session_id: 'ask-open', mode: 'thread', cwd: '/x', thread_id: 'auto' })
+    await recv(it)
+
+    writeFrame(sock, {
+      type: 'tool_call', id: 2, name: 'discord_ask',
+      args: { questions: [{ question: 'q', options: [{ label: 'A' }] }] },
+    })
+    await new Promise(r => setTimeout(r, 30))
+    const askCall = ops.calls.find(c => c.kind === 'ask') as any
+    expect(askCall.allowFrom).toEqual([])
+    ops.resolveAsk(askCall.request_id, { answers: [{ selection: 'A' }] })
+    await recv(it)
+  })
+
+  test('discord_ask in dm mode routes via allowFrom users', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.allowFrom = ['u-primary', 'u-secondary']
+    saveAccess(join(dir, 'access.json'), a)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, { type: 'register', id: 1, session_id: 'ask-dm', mode: 'dm', cwd: '/x' })
+    await recv(it)
+
+    writeFrame(sock, {
+      type: 'tool_call', id: 2, name: 'discord_ask',
+      args: { questions: [{ question: 'q', options: [{ label: 'A' }, { label: 'B' }] }] },
+    })
+    await new Promise(r => setTimeout(r, 30))
+    const askCall = ops.calls.find(c => c.kind === 'ask') as any
+    expect(askCall.route).toEqual({ kind: 'dm', user_ids: ['u-primary', 'u-secondary'] })
+    ops.resolveAsk(askCall.request_id, { answers: [{ selection: 'A' }] })
+    const result = await recv(it)
+    expect(result.type).toBe('tool_result')
+    expect(result.content[0].text).toMatch(/Q1: A/)
+  })
+
+  test('discord_ask cancellation surfaces as tool_result text', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.allowFrom = ['u']
+    saveAccess(join(dir, 'access.json'), a)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, { type: 'register', id: 1, session_id: 's-cancel', mode: 'dm', cwd: '/x' })
+    await recv(it)
+    writeFrame(sock, {
+      type: 'tool_call', id: 2, name: 'discord_ask',
+      args: { questions: [{ question: 'q', options: [{ label: 'A' }] }] },
+    })
+    await new Promise(r => setTimeout(r, 30))
+    const askCall = ops.calls.find(c => c.kind === 'ask') as any
+    ops.resolveAsk(askCall.request_id, { cancelled: true, reason: 'timeout' })
+    const result = await recv(it)
+    expect(result.type).toBe('tool_result')
+    expect(result.content[0].text).toMatch(/did not answer/)
+    expect(result.content[0].text).toMatch(/timeout/)
+  })
+
+  test('discord_ask rejects invalid questions shape', async () => {
+    daemon = await startDaemon({ stateDir: dir, ops: new FakeDiscordOps(), idleExitMs: 60_000 })
+    const sock = await connect(join(dir, 'daemon.sock'))
+    const it = frameIterator(sock)
+    writeFrame(sock, { type: 'register', id: 1, session_id: 's-bad', mode: 'dm', cwd: '/x' })
+    await recv(it)
+    writeFrame(sock, { type: 'tool_call', id: 2, name: 'discord_ask', args: { questions: 'nope' } })
+    const result = await recv(it)
+    expect(result.type).toBe('tool_result')
+    expect(result.isError).toBe(true)
+    expect(result.content[0].text).toMatch(/invalid questions/)
+  })
+
+  test('hook_ask routes to bound session and returns answers', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const a = defaultAccess()
+    a.parentChannelId = 'parent-1'
+    a.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    a.allowFrom = ['user-5']
+    saveAccess(join(dir, 'access.json'), a)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+
+    const shimSock = await connect(join(dir, 'daemon.sock'))
+    const shimIt = frameIterator(shimSock)
+    writeFrame(shimSock, { type: 'register', id: 1, session_id: 'hooked', mode: 'thread', cwd: '/x', thread_id: 'auto' })
+    const ack = await recv(shimIt)
+    expect(ack.type).toBe('register_ack')
+    const threadId = ack.thread_id
+
+    const hookSock = await connect(join(dir, 'daemon.sock'))
+    const hookIt = frameIterator(hookSock)
+    writeFrame(hookSock, {
+      type: 'hook_ask', id: 42, session_id: 'hooked',
+      questions: [{ question: 'go ahead?', options: [{ label: 'Yes' }, { label: 'No' }] }],
+    })
+    await new Promise(r => setTimeout(r, 30))
+    const askCall = ops.calls.find(c => c.kind === 'ask') as any
+    expect(askCall.route).toEqual({ kind: 'thread', chat_id: threadId })
+    ops.resolveAsk(askCall.request_id, { answers: [{ selection: 'Yes' }] })
+
+    const reply = await recv(hookIt)
+    expect(reply.type).toBe('hook_ask_result')
+    expect(reply.id).toBe(42)
+    expect(reply.ok).toBe(true)
+    expect(reply.answers).toEqual(['Yes'])
+  })
+
+  test('hook_ask with unknown session returns ok:false', async () => {
+    daemon = await startDaemon({ stateDir: dir, ops: new FakeDiscordOps(), idleExitMs: 60_000 })
+    const hookSock = await connect(join(dir, 'daemon.sock'))
+    const hookIt = frameIterator(hookSock)
+    writeFrame(hookSock, {
+      type: 'hook_ask', id: 1, session_id: 'no-such-session',
+      questions: [{ question: 'q', options: [{ label: 'A' }] }],
+    })
+    const reply = await recv(hookIt)
+    expect(reply.type).toBe('hook_ask_result')
+    expect(reply.ok).toBe(false)
+    expect(reply.error).toMatch(/no registered session/)
+  })
 })
