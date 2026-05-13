@@ -244,17 +244,22 @@ function registerHandlers(server: Server): void {
     return { content: reply.content, isError: reply.isError }
   })
 
-  server.setNotificationHandler(
-    z.object({
-      method: z.literal('notifications/claude/channel/permission_request'),
-      params: z.object({
-        request_id: z.string(),
-        tool_name: z.string(),
-        description: z.string(),
-        input_preview: z.string(),
-      }),
+  const PermissionRequestSchema = z.object({
+    method: z.literal('notifications/claude/channel/permission_request'),
+    params: z.object({
+      request_id: z.string(),
+      tool_name: z.string(),
+      description: z.string(),
+      input_preview: z.string(),
     }),
-    async ({ params }) => {
+  })
+  type PermissionRequest = z.infer<typeof PermissionRequestSchema>
+  // Cast to the SDK's broad schema type — the generic constraint
+  // `T extends AnyObjectSchema` makes TS try to fully instantiate the
+  // inferred zod type at this call site (TS2589) on stock tsc.
+  server.setNotificationHandler(
+    PermissionRequestSchema as unknown as Parameters<typeof server.setNotificationHandler>[0],
+    async ({ params }: PermissionRequest) => {
       await send({ type: 'permission_request', id: nextId++, ...params })
     },
   )

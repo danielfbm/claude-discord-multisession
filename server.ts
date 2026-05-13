@@ -27,3 +27,5 @@ if (process.argv.includes('--daemon')) {
   const { runShim } = await import('./src/shim')
   await runShim()
 }
+
+export {}
