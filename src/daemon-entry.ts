@@ -6,6 +6,13 @@
  * Kept separate from src/daemon.ts so unit tests can import startDaemon()
  * without pulling in discord.js.
  */
+// proxy-bootstrap installs globalThis.WebSocket = <proxy-aware ws subclass>
+// as a module-load side effect. It MUST be evaluated before discord.js
+// (so @discordjs/ws's WebSocketConstructor captures our subclass). That
+// ordering is enforced by server.ts, which awaits the bootstrap dynamic
+// import before awaiting daemon-entry. The static import here just pulls
+// in the named helpers — the module is already cached at this point.
+import { pickProxyUrl, maskProxyUrl, installHttpProxy } from './proxy-bootstrap'
 import {
   Client, GatewayIntentBits, Partials, ChannelType,
   ButtonBuilder, ButtonStyle, ActionRowBuilder,
@@ -39,6 +46,23 @@ export async function runDaemon(): Promise<void> {
     process.exit(1)
   }
 
+  // Route the gateway WebSocket (via the `ws` package the bootstrap
+  // installed → https.globalAgent) and the REST client (via undici's
+  // global dispatcher) through an HTTP CONNECT proxy when one is
+  // configured. Without this, networks that block direct egress to
+  // discord.com / gateway.discord.gg leave the gateway stuck in SYN_SENT.
+  const proxyUrl = pickProxyUrl()
+  let restAgent: ReturnType<typeof installHttpProxy> | undefined
+  if (proxyUrl) {
+    restAgent = installHttpProxy(proxyUrl)
+    process.stderr.write(`discord daemon: proxy ${maskProxyUrl(proxyUrl)}\n`)
+  } else if (process.env.ALL_PROXY || process.env.all_proxy) {
+    process.stderr.write(
+      `discord daemon: ignoring ALL_PROXY (only http(s):// supported here, ` +
+      `set HTTPS_PROXY or DISCORD_PROXY for an HTTP proxy)\n`,
+    )
+  }
+
   process.on('unhandledRejection', err => {
     process.stderr.write(`discord daemon: unhandled rejection: ${err}\n`)
   })
@@ -54,6 +78,7 @@ export async function runDaemon(): Promise<void> {
       GatewayIntentBits.MessageContent,
     ],
     partials: [Partials.Channel],
+    ...(restAgent ? { rest: { agent: restAgent } } : {}),
   })
 
   const accessFile = join(stateDir, 'access.json')

@@ -18,6 +18,16 @@
  */
 
 if (process.argv.includes('--daemon')) {
+  // Side-effect import: patches globalThis.WebSocket to a proxy-aware
+  // subclass of `ws.WebSocket`. MUST happen before `./src/daemon-entry`
+  // is loaded, because @discordjs/ws (transitively pulled in by
+  // discord.js) captures globalThis.WebSocket at its module-evaluation
+  // time. Under Bun, sibling static imports of an ESM bootstrap and a
+  // CJS module like discord.js do not preserve declaration order — the
+  // CJS module body runs before the ESM side effect. Putting the
+  // bootstrap here (a static import preceding a dynamic import) makes
+  // the order deterministic.
+  await import('./src/proxy-bootstrap')
   const { runDaemon } = await import('./src/daemon-entry')
   await runDaemon()
 } else {
