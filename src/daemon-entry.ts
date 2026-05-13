@@ -59,8 +59,17 @@ export async function runDaemon(): Promise<void> {
   const accessFile = join(stateDir, 'access.json')
   const ops = new RealDiscordOps(client, () => loadAccess(accessFile), stateDir)
 
+  // Promise that resolves on the FIRST gateway 'ready' event. The daemon
+  // register handler awaits this before any channel-fetching call, which
+  // prevents the "channel not found" race when a shim connects during the
+  // ~1-3s login + READY window.
+  const readyPromise = new Promise<void>(resolve => {
+    client.once('ready', () => resolve())
+  })
+
   const handle = await startDaemon({
     stateDir, ops, idleExitMs: 60_000,
+    waitReady: () => readyPromise,
     onShutdown: async () => {
       try { await client.destroy() } catch {}
       process.exit(0)

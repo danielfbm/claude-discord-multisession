@@ -31,6 +31,13 @@ export type DaemonOpts = {
   ops: DiscordOps
   idleExitMs: number
   /**
+   * Resolves once the discord.js gateway is fully READY. The register
+   * handler awaits this before any channel-fetching API call, otherwise
+   * a shim connecting during the login window sees `channel not found`
+   * because the client has no auth/cache yet.
+   */
+  waitReady?: () => Promise<void>
+  /**
    * Called after the internal shutdown unlinks sock + pid. The entrypoint
    * uses this to destroy the discord.js client and call `process.exit(0)`,
    * because discord.js's gateway WebSocket otherwise keeps the event loop
@@ -226,7 +233,7 @@ async function probeStaleSocket(sockPath: string): Promise<void> {
 }
 
 export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
-  const { stateDir, ops, idleExitMs, onShutdown } = opts
+  const { stateDir, ops, idleExitMs, onShutdown, waitReady } = opts
   mkdirSync(stateDir, { recursive: true, mode: 0o700 })
   const sockPath = join(stateDir, 'daemon.sock')
   const pidPath = join(stateDir, 'daemon.pid')
@@ -639,6 +646,7 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
                 reservedThreadId = threadId
                 // Recover parent for a reused binding: bindings.json doesn't
                 // persist parent_id, so a Discord API round-trip is required.
+                if (waitReady) await waitReady()
                 parentId = await ops.verifyThreadParent(threadId)
                 reuseFlag = true
               } else {
@@ -650,6 +658,7 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
                 }
                 const name = deriveThreadName(msg.cwd, msg.session_id, msg.thread_name)
                 try {
+                  if (waitReady) await waitReady()
                   const t = await ops.createThread(access.parentChannelId, name)
                   threadId = t.thread_id
                   parentId = access.parentChannelId
