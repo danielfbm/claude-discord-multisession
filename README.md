@@ -310,6 +310,37 @@ are opt-in per channel ID via `groups`.
 Inbound messages trigger a typing indicator automatically — Discord shows
 "botname is typing…" while the assistant works.
 
+### Read-receipt reactions (default on)
+
+The shim's MCP `instructions` ask the assistant to react with 👀 on the
+inbound message before doing multi-step work, and with ✅ / ❌ when the
+work finishes. This gives the user a passive "Claude saw it / Claude is
+done" signal without spamming reply messages.
+
+To opt out — for example to save the ~270 tokens per turn the extra two
+react calls cost, or to reduce field-name confusion between `react` and
+`reply` in long sessions — set `reactionGuidance` in `access.json`:
+
+```jsonc
+{
+  // ...
+  "reactionGuidance": false
+}
+```
+
+Or use the skill:
+
+```
+/discord:access set reactionGuidance false
+```
+
+The MCP `instructions` blob is built once at shim startup, so this
+takes effect on the next shim restart (Claude Code reconnects on the
+next MCP handshake). When off, the two guidance paragraphs are dropped
+from `instructions` and the assistant will not be prompted to add 👀 /
+✅ / ❌ reactions. All other tools (including `react` itself) keep
+working — only the guidance is conditional.
+
 ## Attachments
 
 Not auto-downloaded. The `<channel>` notification lists each attachment's
@@ -334,6 +365,7 @@ to `$DISCORD_STATE_DIR`, then `$CLAUDE_CONFIG_DIR/channels/discord`, then
 | `discord shim: register failed (parent_channel_unset)` | Launched with `DISCORD_THREAD_ID=auto` but `parentChannelId` is unset. | `/discord:configure parent <channelId>` first, then relaunch. |
 | `discord daemon: login failed: Error [TokenInvalid]` | Token is malformed or revoked. | Developer Portal → Bot → Reset Token, then `/discord:configure <new-token>`. |
 | MCP disconnects after working briefly, no clear error | Multiple daemons racing for the socket (resolved in 0.0.6). | `/plugin update discord@danielfbm-discord`, kill stray `bun ... server.ts --daemon` processes, restart Claude Code. |
+| Tool returns `isError`: `reply requires field 'text' (string); got keys [chat_id, content, message_id]. did you mean 'text' instead of 'content'?` | The assistant called a Discord tool with the wrong field names — usually `content`/`message_id` leaking in from `react`/`edit_message`. Prior to validation this silently sent the 9-byte string "undefined" to the channel. | No operator action needed — the assistant should retry with the correct field names. If it keeps failing, check the LLM's tool input in the session jsonl. |
 
 If `daemon.log` is empty, the daemon never spawned — verify `bun` is on
 `$PATH` and the cache install dir has a populated `node_modules/`.

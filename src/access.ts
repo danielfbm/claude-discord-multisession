@@ -26,6 +26,14 @@ export type Access = {
   chunkMode?: 'length' | 'newline'
   /** Channel under which auto-thread-creation spawns threads. */
   parentChannelId?: string
+  /**
+   * When false, the shim's MCP `instructions` blob omits the
+   * 👀 / ✅ / ❌ read-receipt paragraphs. Treated as `true` when
+   * absent, preserving the historical default. Read once at shim
+   * startup — not hot-reloadable, since `instructions` is published
+   * during MCP server construction.
+   */
+  reactionGuidance?: boolean
 }
 
 export function defaultAccess(): Access {
@@ -53,6 +61,7 @@ export function loadAccess(file: string): Access {
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
       parentChannelId: parsed.parentChannelId,
+      reactionGuidance: parsed.reactionGuidance,
     }
   } catch {
     try { renameSync(file, `${file}.corrupt-${Date.now()}`) } catch {}

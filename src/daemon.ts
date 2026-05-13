@@ -75,6 +75,144 @@ function logRegister(fields: Record<string, unknown>): void {
   process.stderr.write(`discord daemon: register ${parts.join(' ')}\n`)
 }
 
+// Tool-args validation. The Discord MCP `inputSchema` declares required
+// fields and types, but the MCP SDK does NOT enforce those on the server
+// side — schemas are advisory hints for the LLM, not runtime contracts.
+// Without explicit validation here, a wrong-named field (e.g. an LLM
+// confusing reply.text with react.message_id/content) silently coerces
+// through `String(undefined)` to the literal "undefined", which then
+// gets sent to Discord as a 9-byte message. fail-fast with isError so
+// the LLM sees an actionable error frame and can self-correct, instead
+// of polluting Discord with garbage content.
+export type FieldSpec = {
+  name: string
+  // `'array'` is unknown[]; `'string[]'` adds element-type validation
+  // so call sites get a typed string[] back without an `as` cast.
+  type: 'string' | 'number' | 'array' | 'string[]'
+  required: boolean
+  // Optional legacy/compat names accepted in place of `name`. First match
+  // wins, and the value is normalized onto `name` before the typed args
+  // object is returned. Different from the `synonyms` map (4th arg of
+  // validateToolArgs): an alias is silently accepted, while a synonym is
+  // rejected with a "did you mean" hint. Use alias for stable backwards
+  // compatibility, use synonym for LLM-misuse self-correction.
+  aliases?: readonly string[]
+}
+
+// Map a FieldSpec.type literal back to its runtime TS type. Used to
+// reconstruct a typed args object from a `readonly FieldSpec[]` after
+// validation succeeds, so call sites can drop their `as string` casts.
+type SpecType<T extends FieldSpec['type']> =
+  T extends 'string' ? string
+  : T extends 'number' ? number
+  : T extends 'string[]' ? string[]
+  : T extends 'array' ? unknown[]
+  : never
+
+// Build the typed args object from a const-asserted specs array. Required
+// specs become required keys; non-required specs become optional keys.
+// Requires the call site to pass specs `as const` — without it the
+// literal `name`/`type` strings widen to `string` and this mapping
+// degrades to a useless index signature.
+export type SpecsToArgs<S extends readonly FieldSpec[]> =
+  { [K in S[number] as K['required'] extends true  ? K['name'] : never]:  SpecType<K['type']> }
+  & { [K in S[number] as K['required'] extends true ? never : K['name']]?: SpecType<K['type']> }
+
+export function validateToolArgs<S extends readonly FieldSpec[]>(
+  toolName: string,
+  args: Record<string, unknown>,
+  specs: S,
+  // Map: wrong-named field (LLM may type by mistake) → the correct field
+  // name it was probably meant to be. Used purely to enrich the error
+  // hint; nothing is auto-fixed because semantics differ (e.g. react's
+  // `message_id` is the target message, but reply's `reply_to` is the
+  // quote-reply parent — silently swapping them would hide real bugs).
+  //
+  // Aliases (declared per-spec) are the inverse pattern: silently
+  // accepted legacy names that get normalized onto the canonical field.
+  // Use synonyms for LLM-misuse self-correction; use aliases for stable
+  // backwards-compatible field renames.
+  synonyms: Readonly<Record<string, string>> = {},
+): { ok: true; args: SpecsToArgs<S> } | { ok: false; error: string } {
+  const got = Object.keys(args)
+
+  // Synonym pre-check: reject ANY wrong-named field whose canonical
+  // target is absent — even when the canonical is optional. Optional
+  // means "the LLM may legitimately omit it", NOT "it's OK to silently
+  // drop the LLM's intent when it typed the wrong name". Without this
+  // pre-check, `reply({chat_id, text, message_id: 'm'})` would pass
+  // validation and send a non-quoting reply, because `reply_to` is
+  // optional and missing — the quote target gets dropped without any
+  // signal back to the caller. We surface it as a hard error so the
+  // LLM self-corrects on the next turn instead of confusing the user
+  // with a reply that ignores the message they pointed at.
+  //
+  // When BOTH the wrong key and the right key are present, we leave it
+  // to the spec loop below: the right key wins, the wrong key gets
+  // ignored, and that's a survivable misuse (no intent loss).
+  for (const [wrong, right] of Object.entries(synonyms)) {
+    if (wrong in args && !(right in args)) {
+      return {
+        ok: false,
+        error: `${toolName} received unknown field '${wrong}'; did you mean '${right}'? got keys [${got.join(', ')}].`,
+      }
+    }
+  }
+
+  // We may need to normalize an alias hit onto the canonical key. To
+  // avoid mutating the caller's args object, we lazily shallow-clone on
+  // first hit and assign the local `args` reference to the clone.
+  let normalized: Record<string, unknown> | null = null
+
+  for (const spec of specs) {
+    let v = args[spec.name]
+    // Alias fallback: try each declared alias in order. Canonical name
+    // is always preferred — we only look at aliases when canonical is
+    // absent, mirroring the synonym-coexistence policy above.
+    if (v === undefined && spec.aliases) {
+      for (const alias of spec.aliases) {
+        if (alias in args) {
+          v = args[alias]
+          // Lazily clone on first alias hit so we can assign the
+          // canonical key without touching the caller's object.
+          if (normalized === null) normalized = { ...args }
+          normalized[spec.name] = v
+          break
+        }
+      }
+    }
+    if (v === undefined) {
+      if (!spec.required) continue
+      // Required-missing path. Synonym substitution for this same field
+      // has already been caught by the pre-check above, so we don't need
+      // a per-field hint loop here — the error is "you forgot it", not
+      // "you renamed it".
+      return {
+        ok: false,
+        error: `${toolName} requires field '${spec.name}' (${spec.type}); got keys [${got.join(', ')}].`,
+      }
+    }
+    if (spec.type === 'array' || spec.type === 'string[]') {
+      if (!Array.isArray(v)) {
+        return { ok: false, error: `${toolName} expects '${spec.name}' to be ${spec.type}, got ${typeof v}.` }
+      }
+      // Element-type guard for the typed-array variant. Without this,
+      // SpecType<'string[]'> = string[] would be a lie at runtime — a
+      // mixed array would flow through and trip the call site instead.
+      if (spec.type === 'string[]' && v.some(e => typeof e !== 'string')) {
+        return { ok: false, error: `${toolName} expects '${spec.name}' to be string[], got mixed/non-string elements.` }
+      }
+    } else if (typeof v !== spec.type) {
+      return { ok: false, error: `${toolName} expects '${spec.name}' to be ${spec.type}, got ${typeof v}.` }
+    }
+  }
+  // Cast is safe because every required spec.name has been confirmed
+  // present with the right runtime type; optional fields are either
+  // absent or typed-checked above. Return the alias-normalized object
+  // when any alias fired, otherwise the original args reference.
+  return { ok: true, args: (normalized ?? args) as SpecsToArgs<S> }
+}
+
 async function probeStaleSocket(sockPath: string): Promise<void> {
   const result = await new Promise<'alive' | 'stale'>(res => {
     const probe = createConnection(sockPath)
@@ -198,27 +336,72 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
   }
 
   async function runTool(name: string, args: Record<string, unknown>): Promise<{ content: { type: 'text'; text: string }[]; isError?: boolean }> {
+    const fail = (text: string) => ({ content: [{ type: 'text' as const, text }], isError: true })
     try {
       switch (name) {
         case 'reply': {
+          // Synonyms target the historical LLM-misuse pattern that produced
+          // "undefined" Discord messages: `text` typed as `content` (a key
+          // from no real tool — pure hallucination), `text` as `message`
+          // (one-off in May), and `reply_to` as `message_id` (the react /
+          // edit_message field name leaking into reply).
+          //
+          // `as const` on the specs array is what lets validateToolArgs's
+          // SpecsToArgs<S> infer literal field names and types, so v.args
+          // below is fully typed without per-field casts.
+          const v = validateToolArgs('reply', args, [
+            { name: 'chat_id', type: 'string', required: true },
+            { name: 'text', type: 'string', required: true },
+            { name: 'reply_to', type: 'string', required: false },
+            // `string[]` (vs plain `'array'`) lets the validator enforce
+            // element type, so v.args.files is a real string[] and the
+            // call site doesn't need an `as` cast.
+            { name: 'files', type: 'string[]', required: false },
+          ] as const, { content: 'text', message: 'text', message_id: 'reply_to' })
+          if (!v.ok) return fail(v.error)
           const ids = await ops.reply(
-            String(args.chat_id),
-            String(args.text),
-            { reply_to: args.reply_to as string | undefined, files: args.files as string[] | undefined },
+            v.args.chat_id,
+            v.args.text,
+            { reply_to: v.args.reply_to, files: v.args.files },
           )
           const text = ids.length === 1 ? `sent (id: ${ids[0]})` : `sent ${ids.length} parts (ids: ${ids.join(', ')})`
           return { content: [{ type: 'text', text }] }
         }
-        case 'react':
-          await ops.react(String(args.chat_id), String(args.message_id), String(args.emoji))
+        case 'react': {
+          const v = validateToolArgs('react', args, [
+            { name: 'chat_id', type: 'string', required: true },
+            { name: 'message_id', type: 'string', required: true },
+            { name: 'emoji', type: 'string', required: true },
+          ] as const, { text: 'emoji', content: 'emoji', reply_to: 'message_id' })
+          if (!v.ok) return fail(v.error)
+          await ops.react(v.args.chat_id, v.args.message_id, v.args.emoji)
           return { content: [{ type: 'text', text: 'reacted' }] }
+        }
         case 'edit_message': {
-          const id = await ops.edit(String(args.chat_id), String(args.message_id), String(args.text))
+          const v = validateToolArgs('edit_message', args, [
+            { name: 'chat_id', type: 'string', required: true },
+            { name: 'message_id', type: 'string', required: true },
+            { name: 'text', type: 'string', required: true },
+          ] as const, { content: 'text', message: 'text', reply_to: 'message_id' })
+          if (!v.ok) return fail(v.error)
+          const id = await ops.edit(v.args.chat_id, v.args.message_id, v.args.text)
           return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
         }
         case 'fetch_messages': {
-          const limit = Number(args.limit ?? 20)
-          const arr = await ops.fetch(String(args.channel ?? args.chat_id), limit)
+          // `chat_id` is the legacy alias for `channel`. The MCP schema
+          // declares `channel`, but the rest of this API uses `chat_id`,
+          // so older callers and confused LLMs may still emit it. The
+          // alias is silently accepted and normalized onto `channel`, so
+          // the downstream call site can stay uniform.
+          const v = validateToolArgs('fetch_messages', args, [
+            { name: 'channel', type: 'string', required: true, aliases: ['chat_id'] },
+            { name: 'limit', type: 'number', required: false },
+          ] as const)
+          if (!v.ok) return fail(v.error)
+          // limit is now guaranteed `number | undefined` by the validator,
+          // so the previous `Number(args.limit ?? 20)` coercion is gone.
+          const limit = v.args.limit ?? 20
+          const arr = await ops.fetch(v.args.channel, limit)
           const out = arr.length === 0
             ? '(no messages)'
             : arr.map(m =>
@@ -227,18 +410,23 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
           return { content: [{ type: 'text', text: out }] }
         }
         case 'download_attachment': {
+          const v = validateToolArgs('download_attachment', args, [
+            { name: 'chat_id', type: 'string', required: true },
+            { name: 'message_id', type: 'string', required: true },
+          ] as const, { reply_to: 'message_id' })
+          if (!v.ok) return fail(v.error)
           const inboxDir = join(stateDir, 'inbox')
-          const out = await ops.downloadAttachments(String(args.chat_id), String(args.message_id), inboxDir)
+          const out = await ops.downloadAttachments(v.args.chat_id, v.args.message_id, inboxDir)
           if (out.length === 0) return { content: [{ type: 'text', text: 'message has no attachments' }] }
           const lines = out.map(f => `  ${f.path}  (${f.name}, ${f.type}, ${(f.bytes / 1024).toFixed(0)}KB)`)
           return { content: [{ type: 'text', text: `downloaded ${out.length} attachment(s):\n${lines.join('\n')}` }] }
         }
         default:
-          return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true }
+          return fail(`unknown tool: ${name}`)
       }
     } catch (err) {
       const m = err instanceof Error ? err.message : String(err)
-      return { content: [{ type: 'text', text: `${name} failed: ${m}` }], isError: true }
+      return fail(`${name} failed: ${m}`)
     }
   }
 

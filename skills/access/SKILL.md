@@ -128,8 +128,8 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 ### `set <key> <value>`
 
 Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
-`textChunkLimit`, `chunkMode`, `mentionPatterns`, `parentChannelId`.
-Validate types:
+`textChunkLimit`, `chunkMode`, `mentionPatterns`, `parentChannelId`,
+`reactionGuidance`. Validate types:
 - `ackReaction`: string (emoji) or `""` to disable
 - `replyToMode`: `off` | `first` | `all`
 - `textChunkLimit`: number
@@ -138,6 +138,10 @@ Validate types:
 - `parentChannelId`: string (channel snowflake) or `""` to clear. When
   setting a non-empty value, also opt that channel into `groups` if it
   isn't already (mirror `/discord:configure parent`).
+- `reactionGuidance`: boolean. `true` keeps the 👀 / ✅ / ❌ read-receipt
+  paragraphs in MCP `instructions`; `false` drops them (saves ~270 tokens
+  per turn). Read at shim startup only — flipping it requires a shim
+  restart for already-connected sessions to see the change.
 
 Read, set the key, write, confirm.
 

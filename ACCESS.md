@@ -105,6 +105,13 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
 
 **`chunkMode`** chooses the split strategy: `length` cuts exactly at the limit; `newline` prefers paragraph boundaries.
 
+**`reactionGuidance`** toggles the 👀 / ✅ / ❌ read-receipt paragraphs in the shim's MCP `instructions`. Default on (treat absent as `true`). Set to `false` to save ~270 tokens per turn and reduce field-name confusion between `react` and `reply`. Read once at shim startup — flipping it requires a shim restart.
+
+```
+/discord:access set reactionGuidance false
+/discord:access set reactionGuidance true
+```
+
 ## Skill reference
 
 | Command | Effect |
@@ -117,7 +124,7 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
 | `/discord:access policy allowlist` | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`. |
 | `/discord:access group add 846209781206941736` | Enable a guild channel. Flags: `--no-mention`, `--allow id1,id2`. |
 | `/discord:access group rm 846209781206941736` | Disable a guild channel. |
-| `/discord:access set ackReaction 🔨` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`, `parentChannelId`. |
+| `/discord:access set ackReaction 🔨` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`, `parentChannelId`, `reactionGuidance`. |
 | `/discord:configure parent 846209781206941736` | Set the parent channel for `DISCORD_THREAD_ID=auto`. Also opts that channel into `groups`. |
 
 ## Config file
@@ -158,6 +165,10 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
   "chunkMode": "newline",
 
   // Parent channel under which DISCORD_THREAD_ID=auto creates threads.
-  "parentChannelId": "846209781206941736"
+  "parentChannelId": "846209781206941736",
+
+  // 👀 / ✅ / ❌ read-receipt guidance in MCP `instructions`. Default on
+  // when absent. Read once at shim startup.
+  "reactionGuidance": true
 }
 ```

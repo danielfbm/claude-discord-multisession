@@ -41,9 +41,24 @@ describe('access', () => {
       pending: {},
       ackReaction: '👀',
       parentChannelId: '444',
+      reactionGuidance: false,
     }
     saveAccess(file, a)
     expect(loadAccess(file)).toEqual(a)
+  })
+
+  test('reactionGuidance survives an explicit-true roundtrip', () => {
+    // Explicit `true` is semantically distinct from "field absent":
+    // both render identically at runtime today, but a future change
+    // that flips the default would diverge. Pin the value preservation.
+    const a = { ...defaultAccess(), reactionGuidance: true }
+    saveAccess(file, a)
+    expect(loadAccess(file).reactionGuidance).toBe(true)
+  })
+
+  test('reactionGuidance is absent when not set', () => {
+    saveAccess(file, defaultAccess())
+    expect(loadAccess(file).reactionGuidance).toBeUndefined()
   })
 
   test('saveAccess writes atomically and chmods 0600', () => {
