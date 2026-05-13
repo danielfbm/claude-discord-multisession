@@ -132,6 +132,13 @@ export async function runDaemon(): Promise<void> {
   })
 
   client.on('interactionCreate', async (interaction: Interaction) => {
+    // Ask flow (buttons, string-select, modal submit).
+    if ((interaction.isButton() || interaction.isStringSelectMenu() || interaction.isModalSubmit())
+        && interaction.customId.startsWith('ask:')) {
+      try { await ops.handleAskInteraction(interaction as any) }
+      catch (err) { process.stderr.write(`handleAskInteraction failed: ${err}\n`) }
+      return
+    }
     if (!interaction.isButton()) return
     const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(interaction.customId)
     if (!m) return

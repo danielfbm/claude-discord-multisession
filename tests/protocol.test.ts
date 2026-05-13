@@ -22,9 +22,35 @@ describe('protocol', () => {
   })
 
   test('tool_call accepts known tool names', () => {
-    for (const name of ['reply', 'react', 'edit_message', 'fetch_messages', 'download_attachment'] as const) {
+    for (const name of ['reply', 'react', 'edit_message', 'fetch_messages', 'download_attachment', 'discord_ask'] as const) {
       expect(ToolCallMsg.parse({ type: 'tool_call', id: 2, name, args: {} }).name).toBe(name)
     }
+  })
+
+  test('hook_ask roundtrips with valid questions', () => {
+    const m = parseShimMsg({
+      type: 'hook_ask', id: 9, session_id: 'sess',
+      questions: [{ question: 'Pick one', options: [{ label: 'A' }, { label: 'B', description: 'second' }] }],
+    })
+    expect(m.type).toBe('hook_ask')
+  })
+
+  test('hook_ask rejects empty questions', () => {
+    expect(() => parseShimMsg({ type: 'hook_ask', id: 1, session_id: 's', questions: [] })).toThrow()
+  })
+
+  test('hook_ask rejects option with no label', () => {
+    expect(() => parseShimMsg({
+      type: 'hook_ask', id: 1, session_id: 's',
+      questions: [{ question: 'q', options: [{ label: '' }] }],
+    })).toThrow()
+  })
+
+  test('hook_ask_result parses ok and error shapes', () => {
+    const ok = parseDaemonMsg({ type: 'hook_ask_result', id: 1, ok: true, answers: ['A', ['B', 'C']], notes: [undefined, 'free text'] })
+    expect(ok.type).toBe('hook_ask_result')
+    const err = parseDaemonMsg({ type: 'hook_ask_result', id: 2, ok: false, error: 'no session' })
+    expect(err.type).toBe('hook_ask_result')
   })
 
   test('parseShimMsg dispatches on type', () => {

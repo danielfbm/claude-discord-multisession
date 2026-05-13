@@ -1,4 +1,16 @@
+import type { AskQuestion } from './protocol'
+
 export type ReplyOpts = { reply_to?: string; files?: string[] }
+
+export type AskAnswer = {
+  selection: string | string[]
+  notes?: string
+}
+export type AskResult = { answers: AskAnswer[] } | { cancelled: true; reason: string }
+
+export type AskRouteThread = { kind: 'thread'; chat_id: string }
+export type AskRouteDM = { kind: 'dm'; user_ids: string[] }
+export type AskRoute = AskRouteThread | AskRouteDM
 
 export type FetchedMessage = {
   id: string
@@ -36,6 +48,14 @@ export interface DiscordOps {
   verifyThreadParent(thread_id: string): Promise<string | null>
   postPermissionPrompt(chat_id: string, request_id: string, tool_name: string): Promise<void>
   postPermissionPromptDM(allowFrom: string[], request_id: string, tool_name: string): Promise<void>
+  /**
+   * Post one or more questions interactively and resolve with the user's
+   * answers when complete. Each question becomes its own Discord message with
+   * buttons (single-select, ≤5 options) or a string-select menu (multi-select
+   * or >5 options). An "Other" button always opens a modal for free-text.
+   * Authorization is enforced per-interaction against the access allowlist.
+   */
+  ask(route: AskRoute, request_id: string, questions: AskQuestion[], opts: { allowFrom: string[]; timeoutMs: number }): Promise<AskResult>
 }
 
 export class FakeDiscordOps implements DiscordOps {
@@ -43,6 +63,7 @@ export class FakeDiscordOps implements DiscordOps {
   private msgCounter = 0
   private threadCounter = 0
   private threadParents = new Map<string, string>()
+  pendingAsks = new Map<string, (result: AskResult) => void>()
 
   async reply(chat_id: string, text: string, opts: ReplyOpts = {}) {
     this.calls.push({ kind: 'reply', chat_id, text, reply_to: opts.reply_to, files: opts.files ?? [] })
@@ -77,5 +98,17 @@ export class FakeDiscordOps implements DiscordOps {
   }
   async postPermissionPromptDM(allowFrom: string[], request_id: string, tool_name: string) {
     this.calls.push({ kind: 'permPromptDM', allowFrom, request_id, tool_name })
+  }
+  ask(route: AskRoute, request_id: string, questions: AskQuestion[], opts: { allowFrom: string[]; timeoutMs: number }): Promise<AskResult> {
+    this.calls.push({ kind: 'ask', route, request_id, questions, allowFrom: opts.allowFrom, timeoutMs: opts.timeoutMs })
+    return new Promise<AskResult>(res => {
+      this.pendingAsks.set(request_id, res)
+    })
+  }
+  resolveAsk(request_id: string, result: AskResult): void {
+    const r = this.pendingAsks.get(request_id)
+    if (!r) throw new Error(`no pending ask ${request_id}`)
+    this.pendingAsks.delete(request_id)
+    r(result)
   }
 }

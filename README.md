@@ -306,6 +306,38 @@ are opt-in per channel ID via `groups`.
 | `edit_message` | Edit a message the bot previously sent. Useful for "working…" → result progress updates. Only works on the bot's own messages. |
 | `fetch_messages` | Pull recent history from a channel (oldest-first). Capped at 100 per call. Each line includes the message ID so the model can `reply_to` it; attachments marked `+Natt`. |
 | `download_attachment` | Download all attachments from a specific message ID to `~/.claude/channels/discord/inbox/`. Returns file paths + metadata. |
+| `discord_ask` | Ask the Discord user one or more structured questions (1–4 per call). Each question renders as Discord buttons (≤5 options, single-select) or a string-select menu (multi-select or >5 options), plus an **Other…** button that opens a modal for free-text. Blocks until the user answers or the timeout elapses (default 10 min, override via `timeout_ms`). Authorization is enforced per click against `access.allowFrom`. Returns the chosen labels per question. |
+
+### `AskUserQuestion` PreToolUse hook (opt-in)
+
+The plugin ships a `PreToolUse` hook on `AskUserQuestion`
+(`hooks/hooks.json` → `${CLAUDE_PLUGIN_ROOT}/server.ts --ask-hook`) that can
+auto-route the model's built-in `AskUserQuestion` calls through the same
+Discord UI as `discord_ask`. **Disabled by default**; flip it on in
+`access.json`:
+
+```json
+{
+  "askUserQuestionHook": true
+}
+```
+
+When enabled and the user clicks, the hook denies the underlying tool call
+and supplies the answer as the deny reason — that's the only short-circuit
+channel the hook contract exposes today, so intercepted calls show in the
+transcript as denied-with-prose-answer rather than as a clean tool result.
+For best results, prefer calling `discord_ask` directly when possible. When
+the flag is `false` (or the daemon isn't running or no session is bound),
+the hook prints `{}` and Claude Code's built-in UI runs unchanged.
+
+**Routing & authorization for both `discord_ask` and the hook:**
+
+| Session mode | Where the question posts | Who can click |
+| --- | --- | --- |
+| Thread | The bound thread | `access.groups[parent].allowFrom`. **Empty = open**: anyone with thread access can answer (matches inbound message semantics in `gate.ts`). |
+| DM | DM to `access.allowFrom[0]` (the first paired user) | `access.allowFrom` |
+
+The first valid click wins; subsequent clicks see "That question was already answered."
 
 Inbound messages trigger a typing indicator automatically — Discord shows
 "botname is typing…" while the assistant works.

@@ -2,8 +2,9 @@ import { createServer, createConnection, type Server, type Socket } from 'net'
 import { mkdirSync, unlinkSync, writeFileSync, existsSync, chmodSync } from 'fs'
 import { join } from 'path'
 import { readFrames, writeFrame } from './framing'
-import { parseShimMsg } from './protocol'
-import type { DiscordOps } from './discord-ops'
+import { parseShimMsg, AskQuestionSchema } from './protocol'
+import type { DiscordOps, AskRoute, AskResult } from './discord-ops'
+import { z } from 'zod'
 import { loadAccess, saveAccess, pruneExpired } from './access'
 import { loadBindings, upsertBinding, migrateBindingKey } from './bindings'
 import { deriveThreadName } from './session-id'
@@ -49,6 +50,7 @@ type Session = {
   session_id: string
   mode: 'dm' | 'thread'
   thread_id: string | null
+  parent_id: string | null
   sock: Socket
 }
 
@@ -335,7 +337,43 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
     }
   }
 
-  async function runTool(name: string, args: Record<string, unknown>): Promise<{ content: { type: 'text'; text: string }[]; isError?: boolean }> {
+  function routeForSession(s: Session): AskRoute {
+    if (s.mode === 'thread' && s.thread_id) return { kind: 'thread', chat_id: s.thread_id }
+    const access = loadAccess(accessFile)
+    return { kind: 'dm', user_ids: access.allowFrom }
+  }
+
+  /**
+   * Who is authorized to click an ask button for this session?
+   * - DM mode: the global `access.allowFrom`.
+   * - Thread mode: the parent group's `allowFrom` (empty array = anyone
+   *   in the thread can answer, matching `gate.ts` inbound semantics).
+   */
+  function allowFromForSession(s: Session): string[] {
+    const access = loadAccess(accessFile)
+    if (s.mode === 'thread') {
+      if (!s.parent_id) return []
+      return access.groups[s.parent_id]?.allowFrom ?? []
+    }
+    return access.allowFrom
+  }
+
+  function newAskRequestId(): string {
+    const alphabet = 'abcdefghjkmnpqrstuvwxyz'
+    let s = ''
+    for (let i = 0; i < 5; i++) s += alphabet[Math.floor(Math.random() * alphabet.length)]
+    return s
+  }
+
+  function answerToText(ans: AskResult): string {
+    if ('cancelled' in ans) return `User did not answer (${ans.reason}). Ask again or proceed without the answer.`
+    return ans.answers.map((a, i) => {
+      const sel = Array.isArray(a.selection) ? a.selection.join(', ') : a.selection
+      return `Q${i + 1}: ${sel}${a.notes ? ` (notes: ${a.notes})` : ''}`
+    }).join('\n')
+  }
+
+  async function runTool(name: string, args: Record<string, unknown>, session: Session | null): Promise<{ content: { type: 'text'; text: string }[]; isError?: boolean }> {
     const fail = (text: string) => ({ content: [{ type: 'text' as const, text }], isError: true })
     try {
       switch (name) {
@@ -420,6 +458,17 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
           if (out.length === 0) return { content: [{ type: 'text', text: 'message has no attachments' }] }
           const lines = out.map(f => `  ${f.path}  (${f.name}, ${f.type}, ${(f.bytes / 1024).toFixed(0)}KB)`)
           return { content: [{ type: 'text', text: `downloaded ${out.length} attachment(s):\n${lines.join('\n')}` }] }
+        }
+        case 'discord_ask': {
+          if (!session) return fail('discord_ask requires a registered session')
+          const parsed = z.array(AskQuestionSchema).min(1).max(4).safeParse(args.questions)
+          if (!parsed.success) return fail(`invalid questions: ${parsed.error.message}`)
+          const route = routeForSession(session)
+          const allowFrom = allowFromForSession(session)
+          const timeoutMs = Number(args.timeout_ms ?? 600_000)
+          const request_id = newAskRequestId()
+          const result = await ops.ask(route, request_id, parsed.data, { allowFrom, timeoutMs })
+          return { content: [{ type: 'text', text: answerToText(result) }] }
         }
         default:
           return fail(`unknown tool: ${name}`)
@@ -529,12 +578,16 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
           // placeholder uses thread_id=null; inbound routing keys off
           // threadIndex (still unset) or dmSessionId (also still unset), so
           // no traffic can land on this half-registered session yet.
-          sessions.set(msg.session_id, { session_id: msg.session_id, mode: msg.mode, thread_id: null, sock })
+          sessions.set(msg.session_id, { session_id: msg.session_id, mode: msg.mode, thread_id: null, parent_id: null, sock })
 
           // reservedThreadId tracks the thread_id we have synchronously
           // claimed in threadIndex on behalf of this session, so the
           // `finally` block can release it on any failure path.
           let reservedThreadId: string | null = null
+          // parent_id of the bound thread (null in DM mode); resolved per
+          // branch below so ask-flow authorization can key off the right
+          // per-group allowFrom on every interaction.
+          let parentId: string | null = null
           let committed = false
           // reuseFlag distinguishes "we reused an existing bindings.json
           // entry" from "we just created (or are re-claiming via explicit
@@ -584,6 +637,9 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
                 }
                 threadIndex.set(threadId, msg.session_id)
                 reservedThreadId = threadId
+                // Recover parent for a reused binding: bindings.json doesn't
+                // persist parent_id, so a Discord API round-trip is required.
+                parentId = await ops.verifyThreadParent(threadId)
                 reuseFlag = true
               } else {
                 if (!access.parentChannelId) {
@@ -596,6 +652,7 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
                 try {
                   const t = await ops.createThread(access.parentChannelId, name)
                   threadId = t.thread_id
+                  parentId = access.parentChannelId
                 } catch (err) {
                   const errMessage = `createThread failed: ${err instanceof Error ? err.message : String(err)}`
                   writeFrame(sock, { type: 'register_err', id: msg.id, code: 'discord_unavailable', message: errMessage })
@@ -652,6 +709,7 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
                 logRegister({ outcome: 'err', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: threadId, code: 'thread_not_allowed', message: errMessage })
                 continue
               }
+              parentId = parent
               // Recheck post-await: a concurrent register could have claimed
               // this thread while we were verifying its parent.
               if (threadIndex.has(threadId)) {
@@ -732,7 +790,7 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
             logRegister({ outcome: 'ok', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: threadId, reuse: reuseFlag })
             // Finalize: upgrade the placeholder session entry to the real one
             // and bind this connection's outbound identity.
-            sessions.set(msg.session_id, { session_id: msg.session_id, mode: 'thread', thread_id: threadId, sock })
+            sessions.set(msg.session_id, { session_id: msg.session_id, mode: 'thread', thread_id: threadId, parent_id: parentId, sock })
             mySessionId = msg.session_id
             committed = true
           } finally {
@@ -751,8 +809,37 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
         }
 
         if (msg.type === 'tool_call') {
-          const result = await runTool(msg.name, msg.args as Record<string, unknown>)
+          const s = mySessionId ? sessions.get(mySessionId) ?? null : null
+          const result = await runTool(msg.name, msg.args as Record<string, unknown>, s)
           writeFrame(sock, { type: 'tool_result', id: msg.id, ...result })
+          continue
+        }
+
+        if (msg.type === 'hook_ask') {
+          const s = sessions.get(msg.session_id)
+          if (!s) {
+            writeFrame(sock, { type: 'hook_ask_result', id: msg.id, ok: false, error: 'no registered session for session_id' })
+            continue
+          }
+          const route = routeForSession(s)
+          const allowFrom = allowFromForSession(s)
+          const request_id = newAskRequestId()
+          const timeoutMs = msg.timeout_ms ?? 600_000
+          try {
+            const result = await ops.ask(route, request_id, msg.questions, { allowFrom, timeoutMs })
+            if ('cancelled' in result) {
+              writeFrame(sock, { type: 'hook_ask_result', id: msg.id, ok: false, error: result.reason })
+            } else {
+              writeFrame(sock, {
+                type: 'hook_ask_result', id: msg.id, ok: true,
+                answers: result.answers.map(a => a.selection),
+                notes: result.answers.map(a => a.notes),
+              })
+            }
+          } catch (err) {
+            const m = err instanceof Error ? err.message : String(err)
+            writeFrame(sock, { type: 'hook_ask_result', id: msg.id, ok: false, error: m })
+          }
           continue
         }
 
