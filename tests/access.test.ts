@@ -61,6 +61,21 @@ describe('access', () => {
     expect(loadAccess(file).reactionGuidance).toBeUndefined()
   })
 
+  test('registerMode is absent when not set (preserves "always" default)', () => {
+    saveAccess(file, defaultAccess())
+    expect(loadAccess(file).registerMode).toBeUndefined()
+  })
+
+  test('registerMode roundtrips both string values', () => {
+    // Both values must survive a roundtrip — the shim's gate distinguishes
+    // them strictly, so a silent value drop would invert the user's intent.
+    for (const mode of ['always', 'marked-only'] as const) {
+      const a: Access = { ...defaultAccess(), registerMode: mode }
+      saveAccess(file, a)
+      expect(loadAccess(file).registerMode).toBe(mode)
+    }
+  })
+
   test('saveAccess writes atomically and chmods 0600', () => {
     saveAccess(file, defaultAccess())
     expect(statSync(file).mode & 0o777).toBe(0o600)
