@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs'
 import { dirname } from 'path'
+import { resolveAtomicTarget } from './symlink-target'
 
 export type PendingEntry = {
   senderId: string
@@ -95,10 +96,15 @@ export function loadAccess(file: string): Access {
 }
 
 export function saveAccess(file: string, a: Access): void {
-  mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
-  const tmp = file + '.tmp'
+  // Resolve symlinks (including dangling ones) so the rename below writes
+  // into the link's eventual target rather than replacing the symlink
+  // itself. See src/symlink-target.ts for the host-aware dotfiles
+  // motivation and the dangling-symlink edge case.
+  const target = resolveAtomicTarget(file)
+  mkdirSync(dirname(target), { recursive: true, mode: 0o700 })
+  const tmp = target + '.tmp'
   writeFileSync(tmp, JSON.stringify(a, null, 2) + '\n', { mode: 0o600 })
-  renameSync(tmp, file)
+  renameSync(tmp, target)
 }
 
 export function pruneExpired(a: Access): boolean {

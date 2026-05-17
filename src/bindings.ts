@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from 'fs'
 import { dirname } from 'path'
+import { resolveAtomicTarget } from './symlink-target'
 
 export type BindingEntry = {
   thread_id: string
@@ -51,11 +52,16 @@ function nextTmp(file: string): string {
 }
 
 function writeAtomic(file: string, data: string): void {
-  mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
-  const tmp = nextTmp(file)
+  // Resolve symlinks (including dangling ones) so the rename below writes
+  // into the link's eventual target rather than replacing the symlink
+  // itself. See src/symlink-target.ts for the host-aware dotfiles motivation
+  // and the dangling-symlink edge case.
+  const target = resolveAtomicTarget(file)
+  mkdirSync(dirname(target), { recursive: true, mode: 0o700 })
+  const tmp = nextTmp(target)
   try {
     writeFileSync(tmp, data, { mode: 0o600 })
-    renameSync(tmp, file)
+    renameSync(tmp, target)
   } catch (err) {
     // Best-effort cleanup so a failed write does not leave stray tmp files.
     try { unlinkSync(tmp) } catch {}
