@@ -112,6 +112,13 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
 /discord:access set reactionGuidance true
 ```
 
+**`registerMode`** gates which CC sessions register with the daemon. `"always"` (default, absent === `"always"`) registers every shim. `"marked-only"` registers only when at least one of `DISCORD_THREAD_ID` / `DISCORD_THREAD_NAME` is set in the env; sessions without either env exit cleanly with a stderr log line. Useful when only a specific launcher should opt the session into Discord. Read once at shim startup — flipping it requires a shim restart.
+
+```
+/discord:access set registerMode always
+/discord:access set registerMode marked-only
+```
+
 ## Skill reference
 
 | Command | Effect |
@@ -124,7 +131,7 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
 | `/discord:access policy allowlist` | Set `dmPolicy`. Values: `pairing`, `allowlist`, `disabled`. |
 | `/discord:access group add 846209781206941736` | Enable a guild channel. Flags: `--no-mention`, `--allow id1,id2`. |
 | `/discord:access group rm 846209781206941736` | Disable a guild channel. |
-| `/discord:access set ackReaction 🔨` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`, `parentChannelId`, `reactionGuidance`. |
+| `/discord:access set ackReaction 🔨` | Set a config key: `ackReaction`, `replyToMode`, `textChunkLimit`, `chunkMode`, `mentionPatterns`, `parentChannelId`, `reactionGuidance`, `registerMode`. |
 | `/discord:configure parent 846209781206941736` | Set the parent channel for `DISCORD_THREAD_ID=auto`. Also opts that channel into `groups`. |
 
 ## Config file
@@ -169,6 +176,14 @@ Configure outbound behavior with `/discord:access set <key> <value>`.
 
   // 👀 / ✅ / ❌ read-receipt guidance in MCP `instructions`. Default on
   // when absent. Read once at shim startup.
-  "reactionGuidance": true
+  "reactionGuidance": true,
+
+  // Gate which CC sessions register with the daemon.
+  //   "always" (default, absent === "always"): every shim registers.
+  //   "marked-only": shim registers only when at least one of
+  //                  DISCORD_THREAD_ID / DISCORD_THREAD_NAME is set in
+  //                  the env. Sessions without either env exit cleanly.
+  // Read once at shim startup.
+  "registerMode": "always"
 }
 ```

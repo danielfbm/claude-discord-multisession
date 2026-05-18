@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs'
 import { dirname } from 'path'
+import { resolveAtomicTarget } from './symlink-target'
 
 export type PendingEntry = {
   senderId: string
@@ -43,6 +44,20 @@ export type Access = {
    * When false, the hook prints `{}` and Claude Code's built-in UI runs.
    */
   askUserQuestionHook?: boolean
+  /**
+   * Controls whether every CC session that loads the Discord plugin
+   * auto-registers with the daemon.
+   *  - `"always"` (default, absent === `"always"`): historical behavior,
+   *     any shim startup registers.
+   *  - `"marked-only"`: shim registers only when at least one of
+   *     `DISCORD_THREAD_ID` / `DISCORD_THREAD_NAME` is set in the env.
+   *     Sessions without either env exit(0) silently with a stderr line,
+   *     so plain `claude` invocations on the host don't claim a Discord
+   *     channel. Useful when only specific launch wrappers (e.g. a
+   *     personal `ccd`) should opt the session into Discord.
+   * Read once at shim startup; flipping it requires a shim restart.
+   */
+  registerMode?: 'always' | 'marked-only'
 }
 
 export function defaultAccess(): Access {
@@ -72,6 +87,7 @@ export function loadAccess(file: string): Access {
       parentChannelId: parsed.parentChannelId,
       reactionGuidance: parsed.reactionGuidance,
       askUserQuestionHook: parsed.askUserQuestionHook,
+      registerMode: parsed.registerMode,
     }
   } catch {
     try { renameSync(file, `${file}.corrupt-${Date.now()}`) } catch {}
@@ -80,10 +96,15 @@ export function loadAccess(file: string): Access {
 }
 
 export function saveAccess(file: string, a: Access): void {
-  mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
-  const tmp = file + '.tmp'
+  // Resolve symlinks (including dangling ones) so the rename below writes
+  // into the link's eventual target rather than replacing the symlink
+  // itself. See src/symlink-target.ts for the host-aware dotfiles
+  // motivation and the dangling-symlink edge case.
+  const target = resolveAtomicTarget(file)
+  mkdirSync(dirname(target), { recursive: true, mode: 0o700 })
+  const tmp = target + '.tmp'
   writeFileSync(tmp, JSON.stringify(a, null, 2) + '\n', { mode: 0o600 })
-  renameSync(tmp, file)
+  renameSync(tmp, target)
 }
 
 export function pruneExpired(a: Access): boolean {

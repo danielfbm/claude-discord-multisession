@@ -129,7 +129,7 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 
 Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
 `textChunkLimit`, `chunkMode`, `mentionPatterns`, `parentChannelId`,
-`reactionGuidance`. Validate types:
+`reactionGuidance`, `registerMode`. Validate types:
 - `ackReaction`: string (emoji) or `""` to disable
 - `replyToMode`: `off` | `first` | `all`
 - `textChunkLimit`: number
@@ -142,6 +142,13 @@ Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
   paragraphs in MCP `instructions`; `false` drops them (saves ~270 tokens
   per turn). Read at shim startup only — flipping it requires a shim
   restart for already-connected sessions to see the change.
+- `registerMode`: `always` | `marked-only`. `always` (default, also
+  applies when the field is absent) registers every shim with the
+  daemon. `marked-only` registers only when at least one of
+  `DISCORD_THREAD_ID` / `DISCORD_THREAD_NAME` is set in the launching
+  env; sessions without either env exit cleanly with a stderr log line
+  and Claude Code treats the MCP server as absent. Read at shim startup
+  only — flipping it requires a shim restart.
 
 Read, set the key, write, confirm.
 

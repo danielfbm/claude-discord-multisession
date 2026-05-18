@@ -373,6 +373,45 @@ from `instructions` and the assistant will not be prompted to add 👀 /
 ✅ / ❌ reactions. All other tools (including `react` itself) keep
 working — only the guidance is conditional.
 
+### Register mode (gating which sessions claim Discord)
+
+By default any CC session that loads the plugin registers with the daemon
+and starts consuming Discord traffic — handy when every shell launches CC
+through a Discord-aware wrapper. When that isn't the case (for example a
+host where most `claude` invocations are unrelated to Discord and only a
+specific launcher should hook into it), set `registerMode` to require an
+explicit marker:
+
+```jsonc
+{
+  // ...
+  // "always" (default, absent === "always"): every shim registers.
+  // "marked-only": shim registers only when at least one of
+  // DISCORD_THREAD_ID / DISCORD_THREAD_NAME is set in the env.
+  "registerMode": "marked-only"
+}
+```
+
+In `marked-only` mode, a session that boots without either env exits
+cleanly (`exit 0`) and logs a single line to stderr:
+
+```
+discord shim: skipped register (registerMode=marked-only, no DISCORD_THREAD_ID / DISCORD_THREAD_NAME set)
+```
+
+Claude Code treats the MCP server as absent for that session — no error
+banner, no tools exposed. To opt a launcher in, have it export either env
+before `claude` runs (the same envs the thread / DM selection logic
+already reads):
+
+```sh
+# Opt the session in. DISCORD_THREAD_ID=auto picks the lazy-create flow.
+DISCORD_THREAD_ID=auto claude --dangerously-load-development-channels plugin:discord@danielfbm-discord
+```
+
+The value is read once at shim startup; flipping `registerMode` requires
+the next CC launch (or `/mcp` reconnect) to take effect.
+
 ## Attachments
 
 Not auto-downloaded. The `<channel>` notification lists each attachment's

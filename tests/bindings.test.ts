@@ -1,5 +1,15 @@
 import { test, expect, describe, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, rmSync, statSync, writeFileSync, readdirSync, existsSync } from 'fs'
+import {
+  mkdtempSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  readdirSync,
+  existsSync,
+  symlinkSync,
+  lstatSync,
+  readlinkSync,
+} from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
@@ -228,6 +238,111 @@ describe('bindings', () => {
       const onDisk = loadBindings(file)
       expect(Object.keys(onDisk).sort()).toEqual(['external', 'first', 'second'])
       expect(onDisk.external.thread_id).toBe('t-ext')
+    })
+  })
+
+  // Regression: ~/.claude/channels/discord/bindings.json is commonly
+  // symlinked into a dotfiles repo for host-aware management. A naive
+  // atomic write would rename(2) the tmp over the symlink path,
+  // dereferencing the link and orphaning the repo source. Cover both
+  // write entry points the daemon uses.
+  describe('symlink preservation', () => {
+    test('saveBindings keeps the symlink and writes to its target', async () => {
+      const target = join(dir, 'real-bindings.json')
+      writeFileSync(target, '{}\n')
+      const link = join(dir, 'bindings.json')
+      symlinkSync(target, link)
+
+      await saveBindings(link, {
+        sess1: { thread_id: 't1', cwd: '/cwd1', created_at: 1, last_seen_at: 2 },
+      })
+
+      expect(lstatSync(link).isSymbolicLink()).toBe(true)
+      expect(readlinkSync(link)).toBe(target)
+      expect(loadBindings(target).sess1?.thread_id).toBe('t1')
+    })
+
+    test('upsertBinding keeps the symlink and writes to its target', async () => {
+      // This is the hot path: every shim register triggers upsertBinding,
+      // and it was the first to clobber the symlink in practice.
+      const target = join(dir, 'real-bindings.json')
+      writeFileSync(target, '{}\n')
+      const link = join(dir, 'bindings.json')
+      symlinkSync(target, link)
+
+      await upsertBinding(link, 'sess1', {
+        thread_id: 't1', cwd: '/cwd1', created_at: 1, last_seen_at: 2,
+      })
+
+      expect(lstatSync(link).isSymbolicLink()).toBe(true)
+      expect(loadBindings(target).sess1?.thread_id).toBe('t1')
+    })
+
+    test('first write still works when neither path exists yet', async () => {
+      // Initial-boot edge case: dotfiles apply has not run on a new machine,
+      // so file path is missing entirely. realpathSync would throw — we
+      // must fall back to the literal path so file gets created normally.
+      const fresh = join(dir, 'never-existed.json')
+      await saveBindings(fresh, {
+        s: { thread_id: 't', cwd: '/c', created_at: 1, last_seen_at: 2 },
+      })
+      expect(statSync(fresh).isFile()).toBe(true)
+      expect(loadBindings(fresh).s?.thread_id).toBe('t')
+    })
+
+    // Regression (review of the first symlink-preserve patch): dotfiles
+    // commonly drop the symlink in place BEFORE the daemon's first write
+    // produces the target. The naive realpathSync→ENOENT→literal-path
+    // fallback would rename(2) over the symlink and destroy it on that
+    // first write. Both saveBindings and upsertBinding must handle this.
+    test('saveBindings preserves a dangling symlink and creates its target', async () => {
+      const target = join(dir, 'real-bindings.json')
+      const link = join(dir, 'bindings.json')
+      symlinkSync(target, link)
+      expect(existsSync(target)).toBe(false)
+
+      await saveBindings(link, {
+        s1: { thread_id: 't1', cwd: '/x', created_at: 1, last_seen_at: 2 },
+      })
+
+      expect(lstatSync(link).isSymbolicLink()).toBe(true)
+      expect(readlinkSync(link)).toBe(target)
+      expect(existsSync(target)).toBe(true)
+      expect(loadBindings(target).s1?.thread_id).toBe('t1')
+    })
+
+    test('upsertBinding preserves a dangling symlink and creates its target', async () => {
+      const target = join(dir, 'real-bindings.json')
+      const link = join(dir, 'bindings.json')
+      symlinkSync(target, link)
+      expect(existsSync(target)).toBe(false)
+
+      await upsertBinding(link, 'sess1', {
+        thread_id: 't1', cwd: '/x', created_at: 1, last_seen_at: 2,
+      })
+
+      expect(lstatSync(link).isSymbolicLink()).toBe(true)
+      expect(existsSync(target)).toBe(true)
+      expect(loadBindings(target).sess1?.thread_id).toBe('t1')
+    })
+
+    // Regression (third reviewer pass): chained dangling layout. The middle
+    // link must survive the first write just like the entry-point link.
+    test('saveBindings preserves a chained dangling symlink', async () => {
+      const final = join(dir, 'host', 'bindings.json') // does not exist yet
+      const middle = join(dir, 'current')                // symlink → final
+      const entry = join(dir, 'bindings.json')           // symlink → middle
+      symlinkSync(final, middle)
+      symlinkSync(middle, entry)
+
+      await saveBindings(entry, {
+        s1: { thread_id: 't1', cwd: '/x', created_at: 1, last_seen_at: 2 },
+      })
+
+      expect(lstatSync(entry).isSymbolicLink()).toBe(true)
+      expect(lstatSync(middle).isSymbolicLink()).toBe(true)
+      expect(existsSync(final)).toBe(true)
+      expect(loadBindings(final).s1?.thread_id).toBe('t1')
     })
   })
 })
