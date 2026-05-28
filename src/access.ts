@@ -44,6 +44,8 @@ export type Access = {
    * When false, the hook prints `{}` and Claude Code's built-in UI runs.
    */
   askUserQuestionHook?: boolean
+  /** Bot IDs whose messages are allowed through (bot-to-bot dispatch). */
+  allowBots?: string[]
   /**
    * Controls whether every CC session that loads the Discord plugin
    * auto-registers with the daemon.
@@ -87,6 +89,7 @@ export function loadAccess(file: string): Access {
       parentChannelId: parsed.parentChannelId,
       reactionGuidance: parsed.reactionGuidance,
       askUserQuestionHook: parsed.askUserQuestionHook,
+      allowBots: parsed.allowBots,
       registerMode: parsed.registerMode,
     }
   } catch {

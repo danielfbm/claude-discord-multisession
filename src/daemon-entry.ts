@@ -79,7 +79,6 @@ export async function runDaemon(): Promise<void> {
   const dmChannelUsers = new Map<string, string>()
 
   client.on('messageCreate', async (msg: Message) => {
-    if (msg.author.bot) return
     try {
       const isDM = msg.channel.type === ChannelType.DM
       let parentId: string | undefined
@@ -99,6 +98,7 @@ export async function runDaemon(): Promise<void> {
 
       // Permission-reply text intercept (only for allow-listed senders).
       const access = loadAccess(accessFile)
+      if (msg.author.bot && !(access.allowBots ?? []).includes(msg.author.id)) return
       if (access.allowFrom.includes(msg.author.id)) {
         const m = PERMISSION_REPLY_RE.exec(msg.content)
         if (m) {
