@@ -59,6 +59,16 @@ type Session = {
   thread_id: string | null
   parent_id: string | null
   sock: Socket
+  /**
+   * True while this entry is only a synchronously-reserved placeholder whose
+   * register handler has not yet committed (it may still be awaiting
+   * createThread / verifyThreadParent / upsertBinding). A second register for
+   * the same session_id that arrives during this window is a genuine
+   * concurrent race, NOT a reconnect, and must fail fast — taking it over
+   * would let both handlers create a thread. Once committed the flag is
+   * cleared and a later register supersedes it (the takeover / reconnect path).
+   */
+  pending: boolean
 }
 
 // Single-line key=value log emitted for every register attempt so daemon.log
@@ -255,6 +265,25 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
   const permRoutes = new Map<string, string>()   // request_id → session_id
   const pendingPermissions = new Map<string, PendingPermission>()
   let dmSessionId: string | null = null
+
+  // Evict an existing session so a fresh register for the same session_id can
+  // take over (the "newest shim wins" rule). This is what fixes the `/new`
+  // (clear) disconnect: CC respawns the shim and re-registers the same
+  // cwd-derived session_id before the daemon has processed the old socket's
+  // close, so without takeover the reconnect was rejected as `*_session_taken`
+  // and the shim exited. Here we synchronously release every reservation the
+  // stale session held (sessions map, threadIndex, dmSessionId) and destroy
+  // its socket. The destroyed connection's own `finally` is ownership-aware
+  // (it only tears down a session entry whose `.sock` is still itself), so it
+  // will not clobber the incoming registration that replaces this slot.
+  function evictSession(session_id: string): void {
+    const existing = sessions.get(session_id)
+    if (!existing) return
+    sessions.delete(session_id)
+    if (existing.thread_id) threadIndex.delete(existing.thread_id)
+    if (dmSessionId === session_id) dmSessionId = null
+    try { existing.sock.destroy() } catch {}
+  }
 
   function deliverInbound(ev: InboundEvent): void {
     const access = loadAccess(accessFile)
@@ -570,12 +599,26 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
           const inheritedBinding = bindings[msg.session_id]
             ?? (migrationLegacyKey ? bindings[migrationLegacyKey] : undefined)
 
-          if (sessions.has(msg.session_id)) {
-            const code = msg.mode === 'dm' ? 'dm_session_taken' : 'thread_session_taken'
-            const message = 'this session_id is already registered'
-            writeFrame(sock, { type: 'register_err', id: msg.id, code, message })
-            logRegister({ outcome: 'err', mode: msg.mode, session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, code, message })
-            continue
+          const existingSession = sessions.get(msg.session_id)
+          if (existingSession) {
+            if (existingSession.pending) {
+              // A concurrent register for this same session_id is still in
+              // flight (its placeholder is reserved but not committed). This
+              // is a race, not a reconnect — fail fast so only one handler
+              // creates a thread / claims the slot.
+              const code = msg.mode === 'dm' ? 'dm_session_taken' : 'thread_session_taken'
+              const message = 'this session_id is already registered'
+              writeFrame(sock, { type: 'register_err', id: msg.id, code, message })
+              logRegister({ outcome: 'err', mode: msg.mode, session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, code, message })
+              continue
+            }
+            // Committed live session → newest shim wins: supersede it rather
+            // than rejecting the reconnect. Releases the old session's slots
+            // and drops its socket so the registration below starts clean. See
+            // evictSession() for why this is safe against the evicted
+            // connection's own cleanup.
+            logRegister({ outcome: 'takeover', mode: msg.mode, session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd })
+            evictSession(msg.session_id)
           }
 
           // Reserve the session_id synchronously so a concurrent register
@@ -585,7 +628,8 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
           // placeholder uses thread_id=null; inbound routing keys off
           // threadIndex (still unset) or dmSessionId (also still unset), so
           // no traffic can land on this half-registered session yet.
-          sessions.set(msg.session_id, { session_id: msg.session_id, mode: msg.mode, thread_id: null, parent_id: null, sock })
+          const reservation: Session = { session_id: msg.session_id, mode: msg.mode, thread_id: null, parent_id: null, sock, pending: true }
+          sessions.set(msg.session_id, reservation)
 
           // reservedThreadId tracks the thread_id we have synchronously
           // claimed in threadIndex on behalf of this session, so the
@@ -618,6 +662,9 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
               logRegister({ outcome: 'ok', mode: 'dm', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: null })
               dmSessionId = msg.session_id
               mySessionId = msg.session_id
+              // Promote the placeholder to a committed session so a later
+              // register for this session_id takes it over instead of racing.
+              reservation.pending = false
               committed = true
               continue
             }
@@ -798,8 +845,9 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
             writeFrame(sock, { type: 'register_ack', id: msg.id, session_id: msg.session_id, thread_id: threadId })
             logRegister({ outcome: 'ok', mode: 'thread', session_id: msg.session_id, cwd: msg.cwd, canonical_cwd: msg.canonical_cwd, thread_id: threadId, reuse: reuseFlag })
             // Finalize: upgrade the placeholder session entry to the real one
-            // and bind this connection's outbound identity.
-            sessions.set(msg.session_id, { session_id: msg.session_id, mode: 'thread', thread_id: threadId, parent_id: parentId, sock })
+            // (pending:false so a later register can take it over) and bind
+            // this connection's outbound identity.
+            sessions.set(msg.session_id, { session_id: msg.session_id, mode: 'thread', thread_id: threadId, parent_id: parentId, sock, pending: false })
             mySessionId = msg.session_id
             committed = true
           } finally {
@@ -877,10 +925,17 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
       }
     } finally {
       if (mySessionId) {
+        // Ownership-aware teardown: only release the session if its entry is
+        // still THIS connection. After a takeover (evictSession), the slot may
+        // already belong to a newer connection — tearing it down here would
+        // strand the live session and drop its threadIndex route. Guarding on
+        // socket identity makes the evicted connection's close a clean no-op.
         const s = sessions.get(mySessionId)
-        if (s?.thread_id) threadIndex.delete(s.thread_id)
-        if (dmSessionId === mySessionId) dmSessionId = null
-        sessions.delete(mySessionId)
+        if (s && s.sock === sock) {
+          if (s.thread_id) threadIndex.delete(s.thread_id)
+          if (dmSessionId === mySessionId) dmSessionId = null
+          sessions.delete(mySessionId)
+        }
       }
     }
   }

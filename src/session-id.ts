@@ -132,6 +132,69 @@ export function deriveSessionIdInfo(cwd: string, env: NodeJS.ProcessEnv = proces
   }
 }
 
+export type ShimIdentity = {
+  /** Final session_id the shim registers under. */
+  sessionId: string
+  /** sha1(realpath) pre-rewrite key — only set on the DM/legacy cwd path,
+   *  where CWD_REWRITE migration still applies. Undefined for thread/auto. */
+  legacySessionId?: string
+  /** The path that was sha1'd (DM/legacy path only). */
+  canonicalCwd?: string
+  /** Whether a CWD_REWRITE rule changed the path (DM/legacy path only). */
+  rewriteApplied: boolean
+}
+
+/**
+ * Compute the session identity the shim registers under (#2: multi-session in
+ * one project). Identity is keyed on the THREAD, not just the cwd, so two
+ * Claude Code sessions in the same directory no longer collide:
+ *
+ *   1. `CLAUDE_SESSION_ID` override → used verbatim (user owns the key).
+ *   2. Explicit `DISCORD_THREAD_ID=<snowflake>` → `sha1('thread:'+id)`. The
+ *      cwd is irrelevant, so the same explicit thread is one logical session
+ *      (a reconnect supersedes via the daemon's takeover) and two different
+ *      explicit threads in the same cwd are two independent sessions.
+ *   3. `DISCORD_THREAD_ID=auto` → `sha1('auto:'+realpath+' '+ccToken)`. The
+ *      per-CC-session token (the launcher passes `process.ppid`, the Claude
+ *      Code process id) is stable across `/clear` — so an auto session reuses
+ *      its thread when the shim respawns — but differs between concurrent CC
+ *      sessions, so each gets its own thread.
+ *   4. No thread env (DM mode) → legacy `sha1(realpath|canonical)` identity,
+ *      including the CWD_REWRITE migration hints, exactly as before.
+ *
+ * Only the DM/legacy branch carries migration hints; thread/auto identities
+ * are already machine- or process-scoped and never migrate.
+ */
+export function deriveShimIdentity(args: {
+  cwd: string
+  threadEnv?: string
+  override?: string
+  ccToken?: string
+  env?: NodeJS.ProcessEnv
+}): ShimIdentity {
+  const { cwd, threadEnv, override, ccToken } = args
+  if (override) return { sessionId: override, rewriteApplied: false }
+
+  if (threadEnv && threadEnv !== 'auto') {
+    return { sessionId: sha12(`thread:${threadEnv}`), rewriteApplied: false }
+  }
+
+  if (threadEnv === 'auto') {
+    let real: string
+    try { real = realpathSync(cwd) } catch { real = cwd }
+    return { sessionId: sha12(`auto:${real} ${ccToken ?? ''}`), rewriteApplied: false }
+  }
+
+  // DM / legacy: keep the cwd-derived identity and its rewrite migration.
+  const info = deriveSessionIdInfo(cwd, args.env ?? process.env)
+  return {
+    sessionId: info.sessionId,
+    legacySessionId: info.legacySessionId,
+    canonicalCwd: info.canonicalCwd,
+    rewriteApplied: info.rewriteApplied,
+  }
+}
+
 /**
  * Discord thread name. Priority:
  *   1. DISCORD_THREAD_NAME env (passed through register.thread_name)
