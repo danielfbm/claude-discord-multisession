@@ -129,6 +129,80 @@ describe('daemon: register', () => {
     expect(b.ack.code).toBe('dm_session_taken')
   })
 
+  // Takeover (#1): the `/new` (clear) disconnect. CC tears down the shim and
+  // respawns it; the new shim re-registers the SAME cwd-derived session_id
+  // before the daemon has noticed the old socket close. The old behavior
+  // rejected the reconnect with `*_session_taken`, so the shim exited and
+  // Discord stayed "connected but dead" until a manual `/mcp`. The newest
+  // shim must instead WIN: the daemon evicts the stale session (dropping its
+  // socket) and acks the reconnect.
+  test('re-register same session_id (DM) takes over: old socket dropped, new acks', async () => {
+    daemon = await startDaemon({ stateDir: dir, ops: new FakeDiscordOps(), idleExitMs: 60_000 })
+    const sockPath = join(dir, 'daemon.sock')
+
+    const a = await reg(sockPath, 's1', 'dm')
+    expect(a.ack.type).toBe('register_ack')
+
+    // Same session_id, new socket, old one still live: must take over.
+    const b = await reg(sockPath, 's1', 'dm')
+    expect(b.ack.type).toBe('register_ack')
+
+    // The daemon must drop the superseded connection.
+    const fate = await Promise.race([
+      new Promise(r => a.sock.once('close', () => r('closed'))),
+      new Promise(r => setTimeout(() => r('open'), 300)),
+    ])
+    expect(fate).toBe('closed')
+  })
+
+  test('re-register same session_id (thread) takes over and reuses the same thread', async () => {
+    const ops = new FakeDiscordOps()
+    const { saveAccess, defaultAccess } = await import('../src/access')
+    const acc = defaultAccess()
+    acc.parentChannelId = 'parent-1'
+    acc.groups['parent-1'] = { requireMention: false, allowFrom: [] }
+    saveAccess(join(dir, 'access.json'), acc)
+
+    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
+    const sockPath = join(dir, 'daemon.sock')
+
+    // First register creates the thread; socket stays OPEN (the stale one).
+    const sock1 = await connect(sockPath)
+    const it1 = frameIterator(sock1)
+    writeFrame(sock1, { type: 'register', id: 1, session_id: 'sess', mode: 'thread', cwd: '/x', thread_id: 'auto' })
+    const ack1 = await recv(it1)
+    expect(ack1.type).toBe('register_ack')
+    const threadId = ack1.thread_id
+
+    // Reconnect with the same session_id while sock1 is still live.
+    const sock2 = await connect(sockPath)
+    const it2 = frameIterator(sock2)
+    writeFrame(sock2, { type: 'register', id: 1, session_id: 'sess', mode: 'thread', cwd: '/x', thread_id: 'auto' })
+    const ack2 = await recv(it2)
+    expect(ack2.type).toBe('register_ack')
+    // Reuses the bound thread — no second thread created.
+    expect(ack2.thread_id).toBe(threadId)
+    expect(ops.calls.filter(c => c.kind === 'createThread')).toHaveLength(1)
+
+    // The stale connection is dropped.
+    const fate = await Promise.race([
+      new Promise(r => sock1.once('close', () => r('closed'))),
+      new Promise(r => setTimeout(() => r('open'), 300)),
+    ])
+    expect(fate).toBe('closed')
+
+    // And the new connection actually owns routing: an inbound thread message
+    // must land on sock2, proving threadIndex now points at the new session.
+    daemon!.deliverInbound!({
+      chat_id: threadId, message_id: 'm1', user: 'alice', user_id: 'u1',
+      ts: '2026-01-01T00:00:00Z', content: 'after-takeover', isDM: false,
+      parentChannelId: 'parent-1', hasBotMention: false, isReplyToBot: false, attachments: [],
+    })
+    const inbound = await recv(it2)
+    expect(inbound.type).toBe('inbound')
+    expect(inbound.content).toBe('after-takeover')
+  })
+
   test('thread register with auto and parentChannelId set creates a thread', async () => {
     const ops = new FakeDiscordOps()
     const { saveAccess, defaultAccess } = await import('../src/access')

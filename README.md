@@ -171,11 +171,17 @@ DISCORD_THREAD_ID=auto \
 ```
 
 The bot creates a thread named `<cwd-basename>` (e.g. `project`) and binds
-this CC session to it. Subsequent launches from the same cwd reuse the same
-thread.
+this CC session to it. If you `/clear` or the shim respawns, the *same* CC
+process reattaches to that thread (the identity is tied to the CC process,
+not the conversation).
 
-**4. Launch additional sessions from other directories** the same way. Each
-cwd produces a distinct session_id, a distinct thread, and a distinct shim.
+**4. Launch additional sessions** — from other directories, or even the
+**same** directory. Each concurrent Claude Code process gets its own thread:
+with `DISCORD_THREAD_ID=auto` the identity folds in the CC process id, so two
+sessions in one project no longer collide. To pin a session to a specific
+thread regardless of cwd, pass an explicit `DISCORD_THREAD_ID=<snowflake>`
+(below) — two sessions sharing the same explicit thread id supersede each
+other (newest wins).
 
 **5. DMs** continue to land in whichever session was launched *without*
 `DISCORD_THREAD_ID` (the "DM session"). Only one DM session at a time.
@@ -230,7 +236,21 @@ session's MCP server (the **shim**) talks to the daemon over a Unix socket
 at `~/.claude/channels/discord/daemon.sock`. The daemon is lazy-spawned by
 the first shim and idle-exits 60 s after the last shim disconnects.
 
-Session identity: `sha1(realpath(launch_cwd))[:12]`. One CC per cwd.
+Session identity is keyed on the **thread**, so one project can host several
+concurrent sessions:
+
+| Launch | `session_id` | Effect |
+|--------|--------------|--------|
+| `DISCORD_THREAD_ID=<snowflake>` | `sha1('thread:'+id)[:12]` | Identity = the thread. Same id in two sessions → newest supersedes; different ids in one cwd → independent sessions. |
+| `DISCORD_THREAD_ID=auto` | `sha1('auto:'+realpath+' '+ppid)[:12]` | Per-CC-process thread. Stable across `/clear` (same CC process), distinct between concurrent CC instances. |
+| no thread env (DM) | `sha1(realpath\|canonical)[:12]` | Legacy cwd identity + `CLAUDE_DISCORD_CWD_REWRITE` migration. One DM session at a time. |
+| `CLAUDE_SESSION_ID=<x>` | `<x>` verbatim | You own the key (overrides all of the above). |
+
+A register for an already-live `session_id` **takes over**: the daemon drops
+the stale connection and binds the newcomer. This is what lets a `/clear`
+(which respawns the shim) reconnect cleanly instead of being rejected as
+"already registered". A genuine *concurrent* race (two registers in flight at
+once) still fails one fast, so no duplicate thread is created.
 
 Permission prompts in a thread session post inside the bound thread (so the
 human can answer in-context). The DM session keeps fanning prompts to all

@@ -9,7 +9,7 @@ import { join, resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { readFrames, writeFrame } from './framing'
 import { parseDaemonMsg } from './protocol'
-import { deriveSessionIdInfo } from './session-id'
+import { deriveShimIdentity } from './session-id'
 import { getStateDir } from './state-dir'
 import { loadAccess, type Access } from './access'
 
@@ -57,6 +57,41 @@ export function buildInstructions(reactionGuidanceOn: boolean): string {
   return lines.join('\n')
 }
 
+export type RegisterAck = { type: string; code?: string; message?: string; [k: string]: unknown }
+
+// Which register_err codes are worth retrying. Only the session-taken codes:
+// they mean another shim (or a just-superseded one) currently holds this
+// session_id. Paired with the daemon's takeover-on-reconnect, a retry resolves
+// the narrow concurrent-race window — the loser re-sends, the winner has since
+// committed, and the retry takes over cleanly. Everything else
+// (parent_channel_unset, thread_not_allowed, bindings_*_failed) is a terminal
+// config/data error where retrying only delays the inevitable failure.
+const RETRYABLE_REGISTER_CODES = new Set(['dm_session_taken', 'thread_session_taken'])
+
+export function isRetryableRegisterCode(code: string | undefined): boolean {
+  return code !== undefined && RETRYABLE_REGISTER_CODES.has(code)
+}
+
+// Send a register frame, retrying on transient session-taken errors with a
+// fixed delay. Returns the final ack (a success, a terminal error, or the last
+// error after exhausting retries) — the caller decides whether to exit. `send`
+// is a thunk so each attempt gets a fresh request id; `sleep` is injectable so
+// tests don't wait on real timers.
+export async function registerWithRetry(
+  send: () => Promise<RegisterAck>,
+  opts: { retries: number; delayMs: number; sleep?: (ms: number) => Promise<void> },
+): Promise<RegisterAck> {
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)))
+  let ack = await send()
+  let attemptsLeft = opts.retries
+  while (ack.type === 'register_err' && isRetryableRegisterCode(ack.code) && attemptsLeft > 0) {
+    attemptsLeft--
+    await sleep(opts.delayMs)
+    ack = await send()
+  }
+  return ack
+}
+
 // Pure decision helper for the register-mode gate. Exported so tests can
 // cover the truth table without booting the shim. Returns true when the
 // session must NOT register with the daemon (caller exits cleanly).
@@ -75,12 +110,24 @@ export function shouldSkipRegister(
   return !env.DISCORD_THREAD_ID && !env.DISCORD_THREAD_NAME
 }
 
-// When CLAUDE_SESSION_ID is explicitly pinned, the user is taking full
-// responsibility for the key — we don't apply rewrite or send migration
-// hints, since there's no "old key" to migrate from in that case.
-const SESSION_ID_OVERRIDE = process.env.CLAUDE_SESSION_ID
-const SESSION_INFO = SESSION_ID_OVERRIDE ? null : deriveSessionIdInfo(process.cwd())
-const SESSION_ID = SESSION_ID_OVERRIDE ?? SESSION_INFO!.sessionId
+// Session identity (#2). Keyed on the thread so the same project can host
+// multiple concurrent sessions:
+//   - CLAUDE_SESSION_ID pinned → used verbatim (no rewrite / migration).
+//   - explicit DISCORD_THREAD_ID → identity is the thread.
+//   - DISCORD_THREAD_ID=auto → identity is cwd + the per-CC-session token.
+//   - DM (no thread env) → legacy cwd-derived identity + rewrite migration.
+//
+// The per-CC-session token is `process.ppid` — the Claude Code process that
+// spawned this shim. It is stable across `/clear` (CC keeps running, only the
+// shim is respawned) so an auto session reuses its thread, yet differs between
+// concurrently-running CC instances so each gets its own thread.
+const SESSION_INFO = deriveShimIdentity({
+  cwd: process.cwd(),
+  threadEnv: THREAD_ENV,
+  override: process.env.CLAUDE_SESSION_ID,
+  ccToken: String(process.ppid),
+})
+const SESSION_ID = SESSION_INFO.sessionId
 
 async function tryConnect(): Promise<Socket | null> {
   if (!existsSync(SOCK_PATH)) return null
@@ -360,13 +407,21 @@ export async function runShim(): Promise<void> {
   const migrationHints = SESSION_INFO?.rewriteApplied
     ? { legacy_session_id: SESSION_INFO.legacySessionId, canonical_cwd: SESSION_INFO.canonicalCwd }
     : {}
-  const ack = await send<{ type: 'register_ack' | 'register_err'; code?: string; message?: string }>({
-    type: 'register', id: nextId++, session_id: SESSION_ID,
+  const registerFrame = {
+    type: 'register', session_id: SESSION_ID,
     mode: THREAD_ENV ? 'thread' : 'dm', cwd: process.cwd(),
     ...(THREAD_ENV ? { thread_id: THREAD_ENV } : {}),
     ...(THREAD_NAME_ENV ? { thread_name: THREAD_NAME_ENV } : {}),
     ...migrationHints,
-  })
+  }
+  // Retry the narrow concurrent-race window (a sibling shim mid-register for
+  // the same session_id) for ~2s before giving up. The daemon takes over a
+  // committed session immediately, so this only ever loops on the in-flight
+  // placeholder race, which clears in milliseconds.
+  const ack = await registerWithRetry(
+    () => send<RegisterAck>({ ...registerFrame, id: nextId++ }),
+    { retries: 10, delayMs: 200 },
+  )
   if (ack.type !== 'register_ack') {
     process.stderr.write(`discord shim: register failed (${ack.code}): ${ack.message}\n`)
     process.exit(1)

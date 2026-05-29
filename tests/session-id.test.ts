@@ -4,11 +4,14 @@ import { createHash } from 'crypto'
 import {
   deriveSessionId,
   deriveSessionIdInfo,
+  deriveShimIdentity,
   deriveThreadName,
   parseCwdRewriteRules,
   applyCwdRewrite,
   CWD_REWRITE_ENV,
 } from '../src/session-id'
+
+const sha12 = (s: string) => createHash('sha1').update(s).digest('hex').slice(0, 12)
 
 describe('session-id', () => {
   test('deriveSessionId is 12 lowercase hex chars', () => {
@@ -24,6 +27,63 @@ describe('session-id', () => {
 
   test('deriveSessionId differs for different paths', () => {
     expect(deriveSessionId('/tmp/a')).not.toBe(deriveSessionId('/tmp/b'))
+  })
+
+  // #2: session identity is keyed on the THREAD, not just the cwd, so the
+  // same project can host multiple concurrent sessions.
+  describe('deriveShimIdentity', () => {
+    test('CLAUDE_SESSION_ID override wins verbatim, no migration hints', () => {
+      const id = deriveShimIdentity({ cwd: '/repo/a', override: 'pinned-id', threadEnv: 'auto', ccToken: '999' })
+      expect(id.sessionId).toBe('pinned-id')
+      expect(id.rewriteApplied).toBe(false)
+      expect(id.legacySessionId).toBeUndefined()
+    })
+
+    test('explicit thread_id keys identity on the thread, independent of cwd', () => {
+      const a = deriveShimIdentity({ cwd: '/repo/a', threadEnv: '1502536668958162977' })
+      const b = deriveShimIdentity({ cwd: '/repo/DIFFERENT', threadEnv: '1502536668958162977' })
+      // Same explicit thread → same identity regardless of cwd → reconnect/takeover.
+      expect(a.sessionId).toBe(b.sessionId)
+      expect(a.sessionId).toBe(sha12('thread:1502536668958162977'))
+      expect(a.rewriteApplied).toBe(false)
+    })
+
+    test('different explicit threads in the SAME cwd are distinct sessions', () => {
+      const a = deriveShimIdentity({ cwd: '/repo/a', threadEnv: '111' })
+      const b = deriveShimIdentity({ cwd: '/repo/a', threadEnv: '222' })
+      expect(a.sessionId).not.toBe(b.sessionId)
+    })
+
+    test('auto identity is 12-hex, carries no migration hints, distinct from the cwd-only id', () => {
+      const a = deriveShimIdentity({ cwd: '/tmp', threadEnv: 'auto', ccToken: '4321' })
+      expect(a.sessionId).toMatch(/^[0-9a-f]{12}$/)
+      expect(a.rewriteApplied).toBe(false)
+      expect(a.legacySessionId).toBeUndefined()
+      // Must not collide with the legacy DM identity for the same cwd,
+      // otherwise an auto session and a DM session would fight for one slot.
+      const dm = deriveShimIdentity({ cwd: '/tmp', ccToken: '4321' })
+      expect(a.sessionId).not.toBe(dm.sessionId)
+    })
+
+    test('auto: same cwd + same CC token is stable (reuse across /clear)', () => {
+      const a = deriveShimIdentity({ cwd: '/tmp', threadEnv: 'auto', ccToken: '4321' })
+      const b = deriveShimIdentity({ cwd: '/tmp', threadEnv: 'auto', ccToken: '4321' })
+      expect(a.sessionId).toBe(b.sessionId)
+    })
+
+    test('auto: same cwd, different CC token = different session (concurrent CC → own thread)', () => {
+      const a = deriveShimIdentity({ cwd: '/tmp', threadEnv: 'auto', ccToken: '4321' })
+      const b = deriveShimIdentity({ cwd: '/tmp', threadEnv: 'auto', ccToken: '9999' })
+      expect(a.sessionId).not.toBe(b.sessionId)
+    })
+
+    test('DM (no thread env) keeps legacy cwd-based identity + migration hints', () => {
+      const id = deriveShimIdentity({ cwd: '/tmp', ccToken: '4321' })
+      const info = deriveSessionIdInfo('/tmp', {})
+      expect(id.sessionId).toBe(info.sessionId)
+      // Migration plumbing for CWD_REWRITE is preserved on the DM/legacy path.
+      expect(id.legacySessionId).toBe(info.legacySessionId)
+    })
   })
 
   test('deriveThreadName uses basename', () => {
