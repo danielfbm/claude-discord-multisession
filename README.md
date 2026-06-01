@@ -243,6 +243,7 @@ concurrent sessions:
 |--------|--------------|--------|
 | `DISCORD_THREAD_ID=<snowflake>` | `sha1('thread:'+id)[:12]` | Identity = the thread. Same id in two sessions → newest supersedes; different ids in one cwd → independent sessions. |
 | `DISCORD_THREAD_ID=auto` | `sha1('auto:'+realpath+' '+ppid)[:12]` | Per-CC-process thread. Stable across `/clear` (same CC process), distinct between concurrent CC instances. |
+| `DISCORD_THREAD_ID=project` | `sha1(realpath\|canonical)[:12]` | One stable thread per directory. Persists across full CC restarts (unlike `auto`). Carries `CLAUDE_DISCORD_CWD_REWRITE` migration. Use when restart-stability matters more than concurrent-session isolation. |
 | no thread env (DM) | `sha1(realpath\|canonical)[:12]` | Legacy cwd identity + `CLAUDE_DISCORD_CWD_REWRITE` migration. One DM session at a time. |
 | `CLAUDE_SESSION_ID=<x>` | `<x>` verbatim | You own the key (overrides all of the above). |
 

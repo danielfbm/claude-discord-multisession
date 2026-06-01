@@ -114,13 +114,13 @@ export function shouldSkipRegister(
 // multiple concurrent sessions:
 //   - CLAUDE_SESSION_ID pinned → used verbatim (no rewrite / migration).
 //   - explicit DISCORD_THREAD_ID → identity is the thread.
-//   - DISCORD_THREAD_ID=auto → identity is cwd + the per-CC-session token.
+//   - DISCORD_THREAD_ID=auto → identity is cwd + the per-CC-session token
+//     (process.ppid). Stable across /clear, distinct per concurrent CC.
+//   - DISCORD_THREAD_ID=project → identity is sha1(realpath|canonical), same
+//     as DM/legacy but in thread mode. One stable thread per directory that
+//     persists across CC restarts. Use when restart-stability matters more
+//     than concurrent-session isolation.
 //   - DM (no thread env) → legacy cwd-derived identity + rewrite migration.
-//
-// The per-CC-session token is `process.ppid` — the Claude Code process that
-// spawned this shim. It is stable across `/clear` (CC keeps running, only the
-// shim is respawned) so an auto session reuses its thread, yet differs between
-// concurrently-running CC instances so each gets its own thread.
 const SESSION_INFO = deriveShimIdentity({
   cwd: process.cwd(),
   threadEnv: THREAD_ENV,
@@ -407,10 +407,15 @@ export async function runShim(): Promise<void> {
   const migrationHints = SESSION_INFO?.rewriteApplied
     ? { legacy_session_id: SESSION_INFO.legacySessionId, canonical_cwd: SESSION_INFO.canonicalCwd }
     : {}
+  // `project` is a shim-side sentinel: it controls how session_id is derived
+  // (cwd-stable) but the daemon only needs to know to do lazy-create/reuse,
+  // which is what `thread_id: 'auto'` already means. Send 'auto' so the
+  // daemon wire format stays clean and requires no daemon-side changes.
+  const threadDirective = (THREAD_ENV === 'project') ? 'auto' : THREAD_ENV
   const registerFrame = {
     type: 'register', session_id: SESSION_ID,
     mode: THREAD_ENV ? 'thread' : 'dm', cwd: process.cwd(),
-    ...(THREAD_ENV ? { thread_id: THREAD_ENV } : {}),
+    ...(threadDirective ? { thread_id: threadDirective } : {}),
     ...(THREAD_NAME_ENV ? { thread_name: THREAD_NAME_ENV } : {}),
     ...migrationHints,
   }

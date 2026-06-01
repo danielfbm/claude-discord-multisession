@@ -10,6 +10,9 @@
 //                                     (ppid only matters for a LIVE session;
 //                                      for resetting a binding the persisted
 //                                      key is what you want — see README)
+//   DISCORD_THREAD_ID=project      → key = sha1(realpath|canonical)
+//                                     same cwd-stable identity as DM, but
+//                                     runs in thread mode. Survives restarts.
 //   unset (DM)                     → legacy sha1(realpath|canonical)
 import { deriveShimIdentity } from './session-id'
 

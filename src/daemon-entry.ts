@@ -7,7 +7,7 @@
  * without pulling in discord.js.
  */
 import {
-  Client, GatewayIntentBits, Partials, ChannelType,
+  Client, Events, GatewayIntentBits, Partials, ChannelType, MessageFlags,
   ButtonBuilder, ButtonStyle, ActionRowBuilder,
   type Message, type Interaction,
 } from 'discord.js'
@@ -59,12 +59,17 @@ export async function runDaemon(): Promise<void> {
   const accessFile = join(stateDir, 'access.json')
   const ops = new RealDiscordOps(client, () => loadAccess(accessFile), stateDir)
 
-  // Promise that resolves on the FIRST gateway 'ready' event. The daemon
+  // Promise that resolves on the FIRST client-ready event. The daemon
   // register handler awaits this before any channel-fetching call, which
   // prevents the "channel not found" race when a shim connects during the
   // ~1-3s login + READY window.
+  // Use the Events.ClientReady constant rather than a string literal: it
+  // maps to the event name emitted by the installed discord.js version, so this
+  // works across the whole `^14.14.0` range AND stays correct in v15 (where the
+  // deprecated 'ready' alias is removed). A literal 'clientReady' would silently
+  // never fire on old 14.x.
   const readyPromise = new Promise<void>(resolve => {
-    client.once('ready', () => resolve())
+    client.once(Events.ClientReady, () => resolve())
   })
 
   const handle = await startDaemon({
@@ -153,7 +158,7 @@ export async function runDaemon(): Promise<void> {
     if (!m) return
     const access = loadAccess(accessFile)
     if (!access.allowFrom.includes(interaction.user.id)) {
-      await interaction.reply({ content: 'Not authorized.', ephemeral: true }).catch(() => {})
+      await interaction.reply({ content: 'Not authorized.', flags: MessageFlags.Ephemeral }).catch(() => {})
       return
     }
     const [, behavior, request_id] = m
@@ -161,7 +166,7 @@ export async function runDaemon(): Promise<void> {
     if (behavior === 'more') {
       const details = handle.pendingPermissions.get(request_id)
       if (!details) {
-        await interaction.reply({ content: 'Details no longer available.', ephemeral: true }).catch(() => {})
+        await interaction.reply({ content: 'Details no longer available.', flags: MessageFlags.Ephemeral }).catch(() => {})
         return
       }
       let prettyInput: string
@@ -211,7 +216,7 @@ export async function runDaemon(): Promise<void> {
     }
   }, 5000).unref()
 
-  client.once('ready', c => {
+  client.once(Events.ClientReady, c => {
     process.stderr.write(`discord daemon: gateway connected as ${c.user.tag}\n`)
   })
   client.on('error', err => {

@@ -159,11 +159,18 @@ export type ShimIdentity = {
  *      Code process id) is stable across `/clear` — so an auto session reuses
  *      its thread when the shim respawns — but differs between concurrent CC
  *      sessions, so each gets its own thread.
- *   4. No thread env (DM mode) → legacy `sha1(realpath|canonical)` identity,
+ *   4. `DISCORD_THREAD_ID=project` → `sha1(realpath|canonical)`, exactly like
+ *      the DM/legacy path, but runs in thread mode (lazy-creates / reuses a
+ *      thread rather than using the DM channel). One stable thread per
+ *      directory: survives CC restarts, carries CWD_REWRITE migration hints.
+ *      Use this when you want a persistent per-project thread without caring
+ *      about concurrent-session isolation (`auto` is better for that).
+ *   5. No thread env (DM mode) → legacy `sha1(realpath|canonical)` identity,
  *      including the CWD_REWRITE migration hints, exactly as before.
  *
- * Only the DM/legacy branch carries migration hints; thread/auto identities
- * are already machine- or process-scoped and never migrate.
+ * Only the DM/legacy and `project` branches carry migration hints;
+ * thread/auto identities are already machine- or process-scoped and never
+ * migrate.
  */
 export function deriveShimIdentity(args: {
   cwd: string
@@ -175,14 +182,30 @@ export function deriveShimIdentity(args: {
   const { cwd, threadEnv, override, ccToken } = args
   if (override) return { sessionId: override, rewriteApplied: false }
 
-  if (threadEnv && threadEnv !== 'auto') {
-    return { sessionId: sha12(`thread:${threadEnv}`), rewriteApplied: false }
-  }
-
+  // Sentinel values handled before the explicit-snowflake branch so they are
+  // not mistakenly hashed as `sha1('thread:auto')` / `sha1('thread:project')`.
   if (threadEnv === 'auto') {
     let real: string
     try { real = realpathSync(cwd) } catch { real = cwd }
     return { sessionId: sha12(`auto:${real} ${ccToken ?? ''}`), rewriteApplied: false }
+  }
+
+  if (threadEnv === 'project') {
+    // thread mode with a stable, cwd-derived identity — one thread per
+    // directory that persists across CC restarts. Inherits CWD_REWRITE
+    // migration hints so cross-machine projects stay on the same thread.
+    const info = deriveSessionIdInfo(cwd, args.env ?? process.env)
+    return {
+      sessionId: info.sessionId,
+      legacySessionId: info.legacySessionId,
+      canonicalCwd: info.canonicalCwd,
+      rewriteApplied: info.rewriteApplied,
+    }
+  }
+
+  if (threadEnv) {
+    // Explicit Discord snowflake: identity is the thread, cwd is irrelevant.
+    return { sessionId: sha12(`thread:${threadEnv}`), rewriteApplied: false }
   }
 
   // DM / legacy: keep the cwd-derived identity and its rewrite migration.

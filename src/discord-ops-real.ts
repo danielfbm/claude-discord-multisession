@@ -1,5 +1,5 @@
 import {
-  Client, ChannelType, ButtonBuilder, ButtonStyle, ActionRowBuilder, StringSelectMenuBuilder,
+  Client, ChannelType, MessageFlags, ButtonBuilder, ButtonStyle, ActionRowBuilder, StringSelectMenuBuilder,
   ModalBuilder, TextInputBuilder, TextInputStyle,
   type Attachment, type ButtonInteraction, type StringSelectMenuInteraction,
   type ModalSubmitInteraction, type Message, type DMChannel,
@@ -319,17 +319,17 @@ export class RealDiscordOps implements DiscordOps {
     const qIdx = parseInt(parts[3] ?? '-1', 10)
     const pending = this.pendingAsks.get(request_id)
     if (!pending) {
-      try { await (interaction as any).reply({ content: 'This question is no longer pending.', ephemeral: true }) } catch {}
+      try { await (interaction as any).reply({ content: 'This question is no longer pending.', flags: MessageFlags.Ephemeral }) } catch {}
       return true
     }
     // Empty allowFrom = no per-user restriction (thread mode with an open
     // group policy). Anyone who can see the thread can answer.
     if (pending.allowFrom.length > 0 && !pending.allowFrom.includes(interaction.user.id)) {
-      try { await (interaction as any).reply({ content: 'Not authorized.', ephemeral: true }) } catch {}
+      try { await (interaction as any).reply({ content: 'Not authorized.', flags: MessageFlags.Ephemeral }) } catch {}
       return true
     }
     if (qIdx !== pending.currentIdx) {
-      try { await (interaction as any).reply({ content: 'That question was already answered.', ephemeral: true }) } catch {}
+      try { await (interaction as any).reply({ content: 'That question was already answered.', flags: MessageFlags.Ephemeral }) } catch {}
       return true
     }
     const q = pending.questions[qIdx]
@@ -363,7 +363,7 @@ export class RealDiscordOps implements DiscordOps {
     if (kind === 'sub' && interaction.isButton()) {
       const values = pending.selectValues.get(qIdx) ?? []
       if (values.length === 0) {
-        try { await interaction.reply({ content: 'Pick at least one option first.', ephemeral: true }) } catch {}
+        try { await interaction.reply({ content: 'Pick at least one option first.', flags: MessageFlags.Ephemeral }) } catch {}
         return true
       }
       pending.answers.push({ selection: values })
@@ -396,7 +396,7 @@ export class RealDiscordOps implements DiscordOps {
       if (orig) {
         await orig.edit({ content: `${orig.content}\n\n✅ **Other**: ${this.truncate(text, 200)}`, components: [] }).catch(() => {})
       }
-      await interaction.reply({ content: 'Recorded.', ephemeral: true }).catch(() => {})
+      await interaction.reply({ content: 'Recorded.', flags: MessageFlags.Ephemeral }).catch(() => {})
       await this.advance(pending)
       return true
     }

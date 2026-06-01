@@ -84,6 +84,61 @@ describe('session-id', () => {
       // Migration plumbing for CWD_REWRITE is preserved on the DM/legacy path.
       expect(id.legacySessionId).toBe(info.legacySessionId)
     })
+
+    // project mode: stable per-directory identity in thread mode.
+    describe('project mode (DISCORD_THREAD_ID=project)', () => {
+      test('sessionId equals the cwd-based key (same as DM / sha1(realpath))', () => {
+        const project = deriveShimIdentity({ cwd: '/tmp', threadEnv: 'project' })
+        const dm = deriveShimIdentity({ cwd: '/tmp' })
+        const info = deriveSessionIdInfo('/tmp', {})
+        expect(project.sessionId).toBe(dm.sessionId)
+        expect(project.sessionId).toBe(info.sessionId)
+      })
+
+      test('carries migration hints (legacySessionId + canonicalCwd + rewriteApplied)', () => {
+        // Without a rewrite rule the hints are present but rewriteApplied=false.
+        const id = deriveShimIdentity({ cwd: '/tmp', threadEnv: 'project', env: {} })
+        const info = deriveSessionIdInfo('/tmp', {})
+        expect(id.legacySessionId).toBe(info.legacySessionId)
+        expect(id.canonicalCwd).toBe(info.canonicalCwd)
+        expect(id.rewriteApplied).toBe(false)
+      })
+
+      test('is stable across CC restarts (does NOT fold in ccToken)', () => {
+        const a = deriveShimIdentity({ cwd: '/tmp', threadEnv: 'project', ccToken: '1111' })
+        const b = deriveShimIdentity({ cwd: '/tmp', threadEnv: 'project', ccToken: '9999' })
+        // ccToken is ignored for project mode — same key regardless of which CC PID.
+        expect(a.sessionId).toBe(b.sessionId)
+      })
+
+      test('differs across directories (cwd-scoped, not process-scoped)', () => {
+        const a = deriveShimIdentity({ cwd: '/tmp', threadEnv: 'project' })
+        const b = deriveShimIdentity({ cwd: '/var', threadEnv: 'project' })
+        expect(a.sessionId).not.toBe(b.sessionId)
+      })
+
+      test('is distinct from the auto identity for the same cwd+token', () => {
+        const project = deriveShimIdentity({ cwd: '/tmp', threadEnv: 'project', ccToken: '42' })
+        const auto = deriveShimIdentity({ cwd: '/tmp', threadEnv: 'auto', ccToken: '42' })
+        // project uses sha1(realpath), auto uses sha1('auto:'+realpath+' '+token).
+        expect(project.sessionId).not.toBe(auto.sessionId)
+      })
+
+      test('is distinct from an explicit snowflake with the same literal string "project"', () => {
+        // 'project' must NOT be treated as a Discord snowflake (sha1('thread:project')).
+        const p = deriveShimIdentity({ cwd: '/tmp', threadEnv: 'project' })
+        const t = deriveShimIdentity({ cwd: '/tmp', threadEnv: sha12('thread:project') })
+        expect(p.sessionId).not.toBe(t.sessionId)
+      })
+
+      test('respects CWD_REWRITE env (rewriteApplied=true when a rule matches)', () => {
+        const real = realpathSync('/tmp')
+        const env = { [CWD_REWRITE_ENV]: `${real}=/canonical/tmp` }
+        const id = deriveShimIdentity({ cwd: '/tmp', threadEnv: 'project', env })
+        expect(id.rewriteApplied).toBe(true)
+        expect(id.canonicalCwd).toBe('/canonical/tmp')
+      })
+    })
   })
 
   test('deriveThreadName uses basename', () => {
